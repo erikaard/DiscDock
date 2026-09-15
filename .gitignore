@@ -1,0 +1,102 @@
+# DiscDock: a Next.js dashboard (Node.js), a Python service built with PyInstaller, and an Inno Setup installer.
+# See https://git-scm.com/docs/gitignore
+
+# ---------------------------------------------------------------------------
+# Dependencies
+# ---------------------------------------------------------------------------
+/node_modules/
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+/.venv/
+/venv/
+/env/
+
+# ---------------------------------------------------------------------------
+# Build output: dashboard, PyInstaller and the installer
+# ---------------------------------------------------------------------------
+/.next/
+/.vinext/
+/out/
+/dist/
+/build/
+/build-release/
+/release/
+/.wrangler/
+.vercel
+*.egg-info/
+*.tsbuildinfo
+next-env.d.ts
+*.exe
+*.msi
+# Tesseract files copied from node_modules by scripts/copy-ocr-assets.mjs
+/public/ocr/
+
+# ---------------------------------------------------------------------------
+# Python caches, test runs and coverage
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+pytest-cache-files-*/
+.coverage
+.coverage.*
+htmlcov/
+/coverage/
+/.testdata/
+.test-tmp*/
+/test-run-*/
+/.tmp-*/
+/.frozen-final/
+/vlc-help.txt
+
+# ---------------------------------------------------------------------------
+# Secrets and machine-specific settings
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+secrets.bin
+settings.local.json
+# Claude Code launch settings contain paths on this PC
+/.claude/launch.json
+/.claude/settings.local.json
+.vscode/
+.idea/
+
+# ---------------------------------------------------------------------------
+# Logs, databases and ripped media (DiscDock keeps its data outside the repository)
+# ---------------------------------------------------------------------------
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+*.iso
+*.mkv
+*.m2ts
+*.flac
+*.wav
+
+# ---------------------------------------------------------------------------
+# Operating system files
+# ---------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+ehthumbs.db
+desktop.ini
+$RECYCLE.BIN/

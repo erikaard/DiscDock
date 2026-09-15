@@ -1,0 +1,8 @@
+fastapi>=0.115,<1
+uvicorn[standard]>=0.34,<1
+httpx>=0.28,<1
+pydantic>=2.10,<3
+pywin32>=308
+psutil>=6,<8
+apprise>=1.9,<2
+

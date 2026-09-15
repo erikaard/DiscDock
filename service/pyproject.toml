@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "discdock"
+version = "1.9.5"
+description = "Windows-native automatic media ripping service"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "uvicorn[standard]>=0.34,<1",
+  "httpx>=0.28,<1",
+  "pydantic>=2.10,<3",
+  "pywin32>=308",
+  "psutil>=6,<8",
+  "apprise>=1.9,<2",
+]
+
+[project.scripts]
+discdock = "discdock.main:run"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["discdock*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+exclude = [".test-tmp*", ".pytest_cache", "pytest-cache-files-*"]
+
+[tool.ruff.lint]
+ignore = ["ASYNC220", "BLE001", "S110"]

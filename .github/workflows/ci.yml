@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: windows-latest
+    steps:
+      # Actions are pinned to commit hashes; the comment names the release the hash belongs to.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m venv .venv
+          .\.venv\Scripts\python.exe -m pip install -r service\requirements-dev.txt
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          npm ci
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Check dependencies for known vulnerabilities
+        shell: pwsh
+        run: |
+          npm audit --omit=dev --audit-level=high
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          .\.venv\Scripts\python.exe -m pip install pip-audit==2.10.1
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          .\.venv\Scripts\python.exe -m pip_audit
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Lint and test the service
+        shell: pwsh
+        run: |
+          .\.venv\Scripts\python.exe -m ruff check service
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Set-Location service
+          ..\.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Check the dashboard
+        shell: pwsh
+        run: |
+          npm run typecheck
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          npm run lint
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }

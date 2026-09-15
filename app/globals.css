@@ -1,0 +1,148 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "../vendor/shadcn-tailwind-4.13.0.css";
+
+:root {
+  color-scheme: dark;
+  --background: #071013;
+  --foreground: #eef7f5;
+  --card: #0c171a;
+  --card-foreground: #eef7f5;
+  --popover: #0c171a;
+  --popover-foreground: #eef7f5;
+  --primary: #40ddc6;
+  --primary-foreground: #032b27;
+  --secondary: #132326;
+  --secondary-foreground: #e7f3f1;
+  --muted: #132326;
+  --muted-foreground: #8ca3a4;
+  --accent: #173033;
+  --accent-foreground: #effaf8;
+  --destructive: #ff6b73;
+  --border: #1b2b2e;
+  --input: #213437;
+  --ring: #40ddc6;
+  --chart-1: #40ddc6;
+  --chart-2: #65b8ff;
+  --chart-3: #ffca62;
+  --chart-4: #bd8cff;
+  --chart-5: #ff7f79;
+  --radius: 0.875rem;
+  --sidebar: #081215;
+  --sidebar-foreground: #eef7f5;
+  --sidebar-primary: #40ddc6;
+  --sidebar-primary-foreground: #032b27;
+  --sidebar-accent: #132326;
+  --sidebar-accent-foreground: #eef7f5;
+  --sidebar-border: #1b2b2e;
+  --sidebar-ring: #40ddc6;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --font-sans: "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+}
+
+* { border-color: var(--border); }
+html { background: var(--background); }
+body {
+  margin: 0;
+  background: radial-gradient(circle at 52% -10%, rgb(64 221 198 / 7%), transparent 30rem), var(--background);
+  color: var(--foreground);
+  font-family: "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+  text-rendering: optimizeLegibility;
+}
+button, a { -webkit-tap-highlight-color: transparent; }
+.disc-visual {
+  border: 1px solid rgb(255 255 255 / 8%);
+  background:
+    radial-gradient(circle at 38% 31%, rgb(255 255 255 / 11%), transparent 2%),
+    repeating-radial-gradient(circle, transparent 0 8px, rgb(255 255 255 / 2.5%) 9px 10px),
+    conic-gradient(from 210deg, #0a1518, #13272b 20%, #091416 39%, #173034 57%, #091416 78%, #122529);
+  box-shadow: 0 30px 55px rgb(0 0 0 / 35%), inset 0 0 45px rgb(0 0 0 / 38%);
+}
+.disc-ripping {
+  animation: disc-spin 2.2s linear infinite, disc-breathe 1.8s ease-in-out infinite;
+  will-change: transform, filter;
+}
+.disc-center-ripping {
+  animation: center-pulse 1.35s ease-in-out infinite;
+}
+.job-reveal {
+  animation: job-reveal 420ms cubic-bezier(.2, .8, .2, 1) both;
+}
+.poster-reveal {
+  animation: poster-reveal 360ms cubic-bezier(.2, .8, .2, 1) both;
+}
+.progress-live [data-slot="progress-indicator"] {
+  background: linear-gradient(90deg, #2fcab4, #72f3de 45%, #2fcab4 80%);
+  background-size: 180% 100%;
+  animation: progress-flow 1.4s linear infinite;
+}
+.stage-active {
+  animation: stage-pulse 1.25s ease-in-out infinite;
+}
+@keyframes disc-spin {
+  to { transform: rotate(360deg); }
+}
+@keyframes disc-breathe {
+  0%, 100% { filter: brightness(.92) drop-shadow(0 0 0 rgb(64 221 198 / 0%)); }
+  50% { filter: brightness(1.16) drop-shadow(0 0 13px rgb(64 221 198 / 24%)); }
+}
+@keyframes center-pulse {
+  0%, 100% { box-shadow: 0 0 28px rgb(64 221 198 / 12%); }
+  50% { box-shadow: 0 0 50px rgb(64 221 198 / 31%); }
+}
+@keyframes progress-flow {
+  to { background-position: -180% 0; }
+}
+@keyframes stage-pulse {
+  0%, 100% { opacity: .55; box-shadow: 0 0 0 rgb(64 221 198 / 0%); }
+  50% { opacity: 1; box-shadow: 0 0 10px rgb(64 221 198 / 45%); }
+}
+@keyframes job-reveal {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes poster-reveal {
+  from { opacity: 0; transform: scale(.96); }
+  to { opacity: 1; transform: scale(1); }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; }
+}
