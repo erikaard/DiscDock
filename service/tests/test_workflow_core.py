@@ -950,3 +950,65 @@ async def test_failure_moves_staging_made_after_the_data_folder_was_changed(tmp_
     moved = Path(database.job["staging_path"])
     assert moved.is_relative_to((tmp_path / "after" / "failed").resolve()), "not 'Path escapes configured root'"
     assert (moved / "track.flac").read_bytes() == b"partial"
+
+
+@pytest.mark.asyncio
+async def test_always_choose_titles_stops_every_disc_at_the_title_list(tmp_path: Path) -> None:
+    settings = AppSettings(
+        data_root=tmp_path,
+        min_length_seconds=600,
+        max_length_seconds=3600,
+        always_choose_titles=True,
+        omdb_enabled=False,
+        auto_eject=False,
+    )
+    settings.resolved_directories()["logs"].mkdir(parents=True)
+    job = make_job(settings, tmp_path / "raw" / "disc.partial", title="", year="", fingerprint="")
+
+    class Database(MemoryDatabase):
+        def update_job(self, job_id: str, **changes: Any) -> dict[str, Any]:
+            job = super().update_job(job_id, **changes)
+            for field in ("settings", "metadata"):
+                if f"{field}_json" in changes:
+                    job[field] = json.loads(changes[f"{field}_json"])
+            return job
+
+    database = Database(job)
+    drive = DriveInfo(
+        id="drive-id", letter="D:", name="Test drive", media_loaded=True, volume_label="DISC", disc_kind=DiscKind.DVD
+    )
+    service = DiscDockService.__new__(DiscDockService)
+    service.database = database
+    service.settings = settings
+    service.secret_store = SimpleNamespace(all=dict)
+    service.drives = {drive.id: drive}
+    service._drive_locks = defaultdict(asyncio.Lock)
+    service.notifications = FakeNotifications()
+    service.drive_control = SimpleNamespace()
+    service._interruptions = {}
+    titles = [
+        TitleInfo(id=0, duration_seconds=300, size_bytes=200_000_000, chapters=1),
+        TitleInfo(id=1, duration_seconds=2700, size_bytes=4_000_000_000, chapters=18),
+        TitleInfo(id=2, duration_seconds=1200, size_bytes=1_500_000_000, chapters=6),
+    ]
+
+    class Disc:
+        async def inspect(self, owner_id: str, letter: str, min_length: int, *args: Any) -> DiscScan:
+            del owner_id, letter, min_length, args
+            return DiscScan(drive_index=0, disc_name="DISC", title_count=3, titles=titles)
+
+    service._make_mkv = lambda active_settings=None: Disc()  # type: ignore[method-assign]
+    service._rip_and_finish = lambda *args, **kwargs: pytest.fail("nothing is ripped before the titles are chosen")
+
+    await service._process_job("job-id")
+
+    assert database.job["state"] == JobState.AWAITING_INPUT
+    assert database.job["status_detail"] == "Choose which titles to rip, as set in Settings"
+    ticked = {track["id"] for track in database.tracks if track["selected"]}
+    assert ticked == {1}, "the titles between the two lengths decide what is ticked"
+    assert len(database.tracks) == 3, "every title is listed to choose from"
+
+
+def test_always_choose_titles_is_off_unless_it_is_turned_on() -> None:
+    assert AppSettings().always_choose_titles is False
+    assert AppSettings(always_choose_titles=True).always_choose_titles is True

@@ -88,6 +88,7 @@ export function useDiscDock() {
     keepWithoutAi: (jobId: string) => action("keep-without-ai", () => api<Job>(`/api/v1/jobs/${jobId}/ai-repair/keep`, { method: "POST", body: "{}" }), "Keeping the movie without AI frames"),
     addLoadingScreens: (jobId: string) => action("loading-screens", () => api<Job>(`/api/v1/jobs/${jobId}/loading-screens`, { method: "POST", body: "{}" }), "Adding loading screens to the movie"),
     keepDamagedMovie: (jobId: string) => action("keep-damaged-movie", () => api<Job>(`/api/v1/jobs/${jobId}/damage/keep`, { method: "POST", body: "{}" }), "Keeping the movie as it was read"),
+    reviewDamage: (jobId: string) => action("review-damage", () => api<Job>(`/api/v1/jobs/${jobId}/damage/review`, { method: "POST", body: "{}" }), "Looking through the movie for broken parts — no API credit will be used"),
     addTitlesToCompleted: (jobId: string) => action("add-titles", () => api<Job>(`/api/v1/jobs/${jobId}/add-titles`, { method: "POST", body: "{}" }), "Choose the titles to add to the existing folder"),
     chooseRelease: (jobId: string, releaseId: string) => action("choose-release", () => api<Job>(`/api/v1/jobs/${jobId}/continue`, { method: "POST", body: JSON.stringify({ musicbrainz_release: releaseId }) }), releaseId === "none" ? "Ripping the CD without track names" : "Ripping the chosen release"),
     // Not an action: the album search shows MusicBrainz's answer, such as a 503, next to the search field.
@@ -103,6 +104,10 @@ export function useDiscDock() {
       await api<Job>(`/api/v1/jobs/${jobId}`, { method: "PATCH", body: JSON.stringify(patch) });
       return api<Job>(`/api/v1/jobs/${jobId}/continue`, { method: "POST", body: JSON.stringify({ selected_titles: selectedTitles }) });
     }, "Ripping selected titles"),
+    backUpDisc: (jobId: string, patch: { title: string; year: string; media_kind: string }) => action("back-up-disc", async () => {
+      await api<Job>(`/api/v1/jobs/${jobId}`, { method: "PATCH", body: JSON.stringify(patch) });
+      return api<Job>(`/api/v1/jobs/${jobId}/continue`, { method: "POST", body: "{}" });
+    }, "Backing up the disc"),
     updateMetadata: (jobId: string, patch: { title: string; year: string; media_kind: string; metadata: MetadataCandidate }) => action("update-metadata", () => api<Job>(`/api/v1/jobs/${jobId}`, { method: "PATCH", body: JSON.stringify(patch) }), "Title updated"),
     searchMetadata: (query: string, year = "") => action("metadata-search", () => api<MetadataCandidate[]>(`/api/v1/metadata/search?q=${encodeURIComponent(query)}&year=${encodeURIComponent(year)}`)),
     openOutput: (jobId: string) => action("open", () => api(`/api/v1/jobs/${jobId}/open-output`, { method: "POST", body: "{}" })),

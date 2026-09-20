@@ -80,6 +80,7 @@ def output_folder(
         MediaKind.MOVIE: "movies",
         MediaKind.SERIES: "tv",
         MediaKind.MUSIC: "music",
+        MediaKind.OTHER: "other",
         MediaKind.DATA: "data",
     }.get(media_kind, "unidentified")
     name = safe_component(title)

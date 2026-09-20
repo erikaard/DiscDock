@@ -18,7 +18,7 @@ const FONT = "'Segoe UI', Inter, -apple-system, BlinkMacSystemFont, Roboto, 'Hel
 const ICON_NAMES = [
   "disc-3", "scan-search", "film", "music", "hard-drive", "clapperboard", "list-checks", "disc-album", "life-buoy",
   "audio-lines", "search", "image", "archive", "shield-check", "eject", "cpu", "sparkles", "tags", "library",
-  "bell-ring", "layout-dashboard", "hourglass", "disc",
+  "bell-ring", "layout-dashboard", "hourglass", "disc", "folder-search",
 ];
 const icons = Object.fromEntries(
   await Promise.all(
@@ -109,13 +109,13 @@ parts.push(`<text x="112" y="96" class="lead">Insert a disc. DiscDock identifies
 // Every disc starts the same way.
 parts.push(step({ x: 430, y: 140, width: 340, iconName: "disc-3", title: "Insert a disc", lines: ["DiscDock watches every drive"], color: COLORS.teal }));
 parts.push(line("M600 224V262", COLORS.teal));
-parts.push(step({ x: 430, y: 264, width: 340, iconName: "scan-search", title: "Identify the disc", lines: ["Blu-ray, DVD, audio CD or data disc"], color: COLORS.teal }));
+parts.push(step({ x: 430, y: 264, width: 340, iconName: "scan-search", title: "Identify the disc", lines: ["Blu-ray, DVD, audio CD, game or data"], color: COLORS.teal }));
 parts.push(line("M600 348V374", COLORS.rule, { arrow: false }));
 
 const lanes = [
   { centre: 300, width: 190, iconName: "film", label: "Movies & series", color: COLORS.teal },
   { centre: 740, width: 132, iconName: "music", label: "Audio CD", color: COLORS.sky },
-  { centre: 1045, width: 140, iconName: "hard-drive", label: "Data disc", color: COLORS.violet },
+  { centre: 1045, width: 150, iconName: "hard-drive", label: "Game or data", color: COLORS.violet },
 ];
 for (const lane of lanes) {
   const direction = lane.centre > 600 ? 1 : -1;
@@ -138,7 +138,7 @@ parts.push(part({ x: 330, y: 830, width: 230, number: 1, title: "Copy the movie"
 parts.push(line("M445 894V914", COLORS.amber, { dashed: true }));
 parts.push(part({ x: 330, y: 916, width: 230, number: 2, title: "Retry skipped spots", line: "until nothing more comes", color: COLORS.amber }));
 parts.push(line("M445 980V1000", COLORS.amber, { dashed: true }));
-parts.push(part({ x: 330, y: 1002, width: 230, number: 3, title: "Extract the movie", line: "MakeMKV, or VLC or FFmpeg", color: COLORS.amber }));
+parts.push(part({ x: 330, y: 1002, width: 230, number: 3, title: "Extract the movie", line: "MakeMKV, then FFmpeg, then VLC", color: COLORS.amber }));
 
 // Audio CDs: cyanrip, with the album found on MusicBrainz meanwhile.
 parts.push(line("M740 436V468", COLORS.sky));
@@ -149,9 +149,11 @@ parts.push(step({ x: 610, y: 590, width: 260, iconName: "search", title: "Find t
 parts.push(line("M740 674V708", COLORS.sky));
 parts.push(step({ x: 610, y: 710, width: 260, iconName: "image", title: "Pick the cover", lines: ["Cover Art Archive or your", "photo in the cover editor"], color: COLORS.sky }));
 
-// Data discs.
+// Games, programs and any other disc.
 parts.push(line("M1045 436V468", COLORS.violet));
-parts.push(step({ x: 930, y: 470, width: 230, iconName: "archive", title: "Save an ISO image", lines: ["An exact copy of", "the whole disc"], color: COLORS.violet }));
+parts.push(step({ x: 930, y: 470, width: 230, iconName: "folder-search", title: "Show what is on it", lines: ["Every file, so you can", "see it and name it"], color: COLORS.violet }));
+parts.push(line("M1045 554V588", COLORS.violet));
+parts.push(step({ x: 930, y: 590, width: 230, iconName: "archive", title: "Copy the whole disc", lines: ["An image that opens", "as a drive, checked"], color: COLORS.violet }));
 
 // Every rip is checked, and the disc comes out.
 const BUS = 1110;
@@ -178,7 +180,7 @@ parts.push(step({ x: 80, y: 1432, width: 320, iconName: "cpu", title: "Transcode
 parts.push(step({ x: 440, y: 1432, width: 320, iconName: "sparkles", title: "Loading screens or AI repair", lines: ["For movies from damaged discs"], color: COLORS.amber, dashed: true }));
 parts.push(step({ x: 800, y: 1432, width: 320, iconName: "tags", title: "Name and tag the tracks", lines: ["Or wait in staging for the album"], color: COLORS.sky }));
 parts.push(line("M420 1550V1588", COLORS.emerald));
-parts.push(step({ x: 260, y: 1590, width: 320, iconName: "library", title: "Move into the library", lines: ["Movies, series, music and ISOs"], color: COLORS.emerald }));
+parts.push(step({ x: 260, y: 1590, width: 320, iconName: "library", title: "Move into the library", lines: ["Movies, series, music and backups"], color: COLORS.emerald }));
 parts.push(line("M580 1632H618", COLORS.emerald));
 parts.push(step({ x: 620, y: 1590, width: 320, iconName: "bell-ring", title: "Notify you", lines: ["Discord, Telegram, email and more"], color: COLORS.emerald }));
 parts.push(line("M940 1632H1162Q1182 1632 1182 1612V202Q1182 182 1162 182H772", COLORS.teal, { dashed: true }));
@@ -196,7 +198,7 @@ const markers = Object.entries(COLORS)
 
 const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${WIDTH}" height="${HEIGHT}" viewBox="0 0 ${WIDTH} ${HEIGHT}" role="img" aria-labelledby="flow-title flow-description">
 <title id="flow-title">How DiscDock works</title>
-<desc id="flow-description">A disc is inserted and identified. Movies and series are scanned, named and ripped with MakeMKV. When MakeMKV hits damage, a rescue rip copies the movie while skipping unreadable blocks, retries the skipped spots, and extracts the movie with MakeMKV, VLC or FFmpeg. Audio CDs are ripped to FLAC with cyanrip while the album is found on MusicBrainz. Data discs are saved as ISO images. Every rip is verified and the disc is ejected. Then movies can be transcoded or get loading screens or AI repair, and CD tracks are named and tagged or wait in staging for their album, before everything moves into the library and you are notified. A second drive can rip meanwhile.</desc>
+<desc id="flow-description">A disc is inserted and identified. Movies and series are scanned, named and ripped with MakeMKV. When MakeMKV hits damage, a rescue rip copies the movie while skipping unreadable blocks, retries the skipped spots, and extracts the movie with MakeMKV, then FFmpeg, then VLC, whichever manages first. Audio CDs are ripped to FLAC with cyanrip while the album is found on MusicBrainz. A game, program or any other disc has its files listed so you can name it, and is then copied whole into an image that opens as a drive, checked against the disc. Every rip is verified and the disc is ejected. Then movies can be transcoded or get loading screens or AI repair, and CD tracks are named and tagged or wait in staging for their album, before everything moves into the library and you are notified. A second drive can rip meanwhile.</desc>
 <!-- Generated by scripts/make-flowchart.mjs. Icons: Lucide (ISC license). -->
 <defs>
 <radialGradient id="glow" cx="88%" cy="0%" r="75%"><stop offset="0" stop-color="${COLORS.teal}" stop-opacity="0.16"/><stop offset="1" stop-color="${COLORS.teal}" stop-opacity="0"/></radialGradient>

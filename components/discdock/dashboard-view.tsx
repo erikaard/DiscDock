@@ -1,21 +1,22 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
 import {
   Activity, AlertTriangle, Check, CircleStop, Crop, Disc3, Eject, Film, FolderOpen,
   HardDrive, ImageOff, KeyRound, ListChecks, Loader2, Music, PencilLine, Play, RefreshCw,
-  LifeBuoy, RotateCw, ScanBarcode, Search, Settings2, SkipForward, Sparkles,
+  LifeBuoy, MoreHorizontal, RotateCw, ScanBarcode, Search, Settings2, SkipForward, Sparkles, Wrench,
 } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Progress } from "@/components/ui/progress";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { Skeleton } from "@/components/ui/skeleton";
-import { addToExistingFromJob, aiRepairFromJob, albumCoverUrl, albumFromJob, albumName, albumPhotoUrl, archiveCoverUrl, damageDetailsFromJob, describeRelease, musicReleasesFromJob, rescueFromJob, type AiRepairPlan, type AlbumRelease, type Bootstrap, type Drive, type Job, type MediaKind, type MetadataCandidate, type RescueStatus } from "@/lib/discdock-api";
+import { addToExistingFromJob, aiRepairFromJob, albumCoverUrl, albumFromJob, albumName, albumPhotoUrl, archiveCoverUrl, awaitingDiscBackup, damageDetailsFromJob, describeRelease, discContentsFromJob, musicReleasesFromJob, offerDamageReview, rescueFromJob, type AiRepairPlan, type AlbumRelease, type Bootstrap, type Drive, type Job, type MediaKind, type MetadataCandidate, type RescueStatus } from "@/lib/discdock-api";
 import type { DiscDockControls } from "@/hooks/use-discdock";
 import { clearAlbumDraft, clearCoverEdit, readAlbumDraft, readCoverEdit, writeAlbumDraft, writeCoverEdit, type AlbumDraft } from "@/lib/album-draft";
 import type { CoverEdit } from "@/lib/cover-image";
@@ -24,7 +25,7 @@ import { tracksFromText } from "@/lib/ocr-tracks";
 import { BarcodeScanner } from "./barcode-scanner";
 import { CoverEditor } from "./cover-editor";
 import { PhotoCapture } from "./photo-capture";
-import { formatDate, StateBadge, titleFor } from "./status";
+import { formatBytes, formatDate, StateBadge, titleFor } from "./status";
 
 const ACTIVE = new Set(["detected", "inspecting", "identifying", "awaiting_input", "awaiting_repair", "queued", "ripping", "ripped", "verifying", "transcoding", "finalizing", "ejecting", "cancelling"]);
 // The service refuses to eject the disc while its job is in one of these states.
@@ -107,6 +108,12 @@ function aiRepairActive(job: Job): boolean {
 
 function offerDamageRecovery(job: Job): boolean {
   return ["dvd", "bluray"].includes(job.disc_type) && ["ripping", "failed", "cancelled", "interrupted"].includes(job.state) && Boolean(discReadWarning(job)) && !damageRecoveryActive(job);
+}
+
+/** The free estimate for replacing a finished movie's broken parts, when one was worked out. */
+function aiEstimateFromJob(job: Job): AiRepairPlan | null {
+  const plan = aiRepairFromJob(job);
+  return plan && plan.status !== "applied" && plan.segments.length > 0 ? plan : null;
 }
 
 function offerAiRepair(job: Job): boolean {
@@ -302,6 +309,7 @@ function ActiveJobCard({ job, busy, controls }: { job?: Job; busy: string | null
     );
   }
   if (job.state === "awaiting_input" && musicReleasesFromJob(job).length > 0) return <ReleaseChoiceCard key={`${job.id}-${job.version}`} job={job} busy={busy} controls={controls} />;
+  if (awaitingDiscBackup(job)) return <DiscBackupCard key={`${job.id}-${job.version}`} job={job} busy={busy} controls={controls} />;
   if (job.state === "awaiting_input") return <ManualSelectionCard key={`${job.id}-${job.version}`} job={job} busy={busy} controls={controls} />;
   const stageIndex = ["recovering", "ai_salvage", "ai_analyzing", "ai_review", "ai_repair"].includes(job.stage) ? 2 : Math.max(0, STAGES.indexOf(job.stage));
   const isCd = job.disc_type === "audio_cd";
@@ -501,6 +509,96 @@ function WorkingTitleEditor({ job, busy, controls, onSaved }: { job: Job; busy: 
       {selectedMatch?.provider === "omdb" && <p className="mt-3 text-xs text-emerald-300">Selected from OMDb · {selectedMatch.provider_id}</p>}
       <div className="mt-4 flex justify-end gap-2"><Button disabled={busy !== null} variant="ghost" size="sm" onClick={onSaved}>Cancel</Button><Button disabled={busy !== null || !title.trim()} size="sm" className="gap-2 bg-primary text-primary-foreground" onClick={() => void save()}>{busy === "update-metadata" ? <Loader2 className="size-4 animate-spin" /> : <Check className="size-4" />} Save title</Button></div>
     </div>
+  );
+}
+
+const DISC_KIND_LABELS: Record<string, string> = {
+  game: "Game or program disc",
+  software: "Software disc",
+  media: "Music or video files",
+  pictures: "Pictures",
+  documents: "Documents",
+  files: "Files",
+};
+
+/** A data disc waiting to be recognised: it shows what is on the disc, then backs it up under a name. */
+function DiscBackupCard({ job, busy, controls }: { job: Job; busy: string | null; controls: DiscDockControls }) {
+  const contents = discContentsFromJob(job);
+  const [title, setTitle] = useState(() => contents?.suggested_title || job.title || job.disc_label || "");
+  const [year, setYear] = useState(job.year.slice(0, 4));
+  const [filter, setFilter] = useState("");
+  const [showAll, setShowAll] = useState(false);
+  const entries = contents?.entries ?? [];
+  const needle = filter.trim().toLowerCase();
+  const matching = needle ? entries.filter((entry) => entry.path.toLowerCase().includes(needle)) : entries;
+  const shown = showAll ? matching.slice(0, 2000) : matching.slice(0, 12);
+  const folders = contents?.top_level ?? [];
+  const canStart = title.trim().length > 0 && busy === null;
+  return (
+    <Card className="job-reveal border-primary/20 bg-card shadow-none">
+      <CardHeader className="pb-3">
+        <div className="flex items-start justify-between gap-4">
+          <div className="min-w-0">
+            <p className="text-xs font-medium uppercase tracking-[0.16em] text-primary">Back up this disc</p>
+            <CardTitle className="mt-1 truncate text-lg">{job.disc_label || "Data disc"}</CardTitle>
+          </div>
+          <Badge variant="outline" className="shrink-0 border-primary/25 text-primary">{DISC_KIND_LABELS[contents?.kind ?? "files"] ?? "Files"}</Badge>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <p className="text-sm leading-6 text-muted-foreground">
+          {contents?.unreadable
+            ? "Windows could not read this disc's file system, so its files cannot be listed. DiscDock can still copy the whole disc into an image."
+            : `${contents?.summary ?? "Holds files."} ${contents?.file_count ?? 0} files, ${formatBytes(contents?.total_bytes ?? 0)}. The backup is an image of the whole disc: open it with a double-click and it appears as a drive.`}
+          {contents?.note ? ` ${contents.note}` : ""}
+        </p>
+        {folders.length > 0 && (
+          <div className="flex flex-wrap gap-2">
+            {folders.slice(0, 8).map((folder) => (
+              <span key={folder.name} className="rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1 text-xs text-muted-foreground">
+                <span className="font-medium text-foreground">{folder.name}</span> · {folder.file_count} {folder.file_count === 1 ? "file" : "files"} · {formatBytes(folder.total_bytes)}
+              </span>
+            ))}
+          </div>
+        )}
+        {entries.length > 0 && (
+          <div className="rounded-xl border border-white/8 bg-black/10">
+            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/8 px-3 py-2">
+              <div className="relative min-w-[12rem] flex-1">
+                <Search className="pointer-events-none absolute left-3 top-2.5 size-3.5 text-muted-foreground" />
+                <Input aria-label="Search the files on this disc" value={filter} onChange={(event) => { setFilter(event.target.value); setShowAll(true); }} placeholder="Search the files on this disc" className="h-9 border-white/10 bg-white/[0.025] pl-8 text-xs" />
+              </div>
+              <span className="text-xs text-muted-foreground">{matching.length} of {entries.length} {entries.length === 1 ? "file" : "files"}</span>
+            </div>
+            <div className="max-h-56 overflow-y-auto divide-y divide-white/5">
+              {shown.map((entry) => (
+                <div key={entry.path} className="flex items-center justify-between gap-4 px-3 py-1.5 text-xs">
+                  <span className="truncate font-mono text-muted-foreground">{entry.path}</span>
+                  <span className="shrink-0 tabular-nums text-muted-foreground">{formatBytes(entry.size)}</span>
+                </div>
+              ))}
+              {shown.length === 0 && <p className="px-3 py-3 text-xs text-muted-foreground">No file on the disc matches that.</p>}
+            </div>
+            {!showAll && matching.length > shown.length && (
+              <button type="button" className="w-full border-t border-white/8 px-3 py-2 text-xs font-medium text-primary hover:bg-white/[0.03]" onClick={() => setShowAll(true)}>Show all {matching.length} files</button>
+            )}
+          </div>
+        )}
+        <div className="flex flex-wrap items-end gap-3">
+          <div className="min-w-[14rem] flex-1">
+            <label className="mb-1 block text-xs font-medium text-muted-foreground" htmlFor={`backup-name-${job.id}`}>What is this disc?</label>
+            <Input id={`backup-name-${job.id}`} value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Name for the backup" className="border-white/10 bg-white/[0.025]" />
+          </div>
+          <div className="w-28">
+            <label className="mb-1 block text-xs font-medium text-muted-foreground" htmlFor={`backup-year-${job.id}`}>Year</label>
+            <Input id={`backup-year-${job.id}`} value={year} onChange={(event) => setYear(event.target.value.replace(/\D/g, "").slice(0, 4))} placeholder="Optional" className="border-white/10 bg-white/[0.025]" />
+          </div>
+          <Button disabled={!canStart} className="gap-2" onClick={() => void controls.backUpDisc(job.id, { title: title.trim(), year, media_kind: "other" })}>
+            {busy === "back-up-disc" ? <Loader2 className="size-4 animate-spin" /> : <HardDrive className="size-4" />} Back up this disc
+          </Button>
+        </div>
+      </CardContent>
+    </Card>
   );
 }
 
@@ -1013,6 +1111,89 @@ function ReleaseChoiceCard({ job, busy, controls }: { job: Job; busy: string | n
   );
 }
 
+type JobAction = {
+  key: string;
+  label: string;
+  detail: string;
+  busyKey: string;
+  icon: ReactNode;
+  run: () => void;
+};
+
+/** What can still be done with a job, most useful first. The first one is the button; the rest wait in the menu. */
+function jobActions(job: Job, controls: DiscDockControls): JobAction[] {
+  const actions: JobAction[] = [];
+  // Repair works through every method by itself, so a separate retry would do the same thing.
+  const repairing = offerDamageRecovery(job) && job.error_code !== "ai_repair_not_possible";
+  if (repairing) {
+    actions.push({
+      key: "repair",
+      label: "Repair",
+      detail: "Read what the drive still can and work through the repair methods, fastest first",
+      busyKey: "recover-damaged",
+      icon: <LifeBuoy className="size-3.5" />,
+      run: () => confirmDamageRecovery(job, controls),
+    });
+  }
+  if (offerFinishRescued(job)) {
+    actions.push({
+      key: "finish",
+      label: "Finish with what's rescued",
+      detail: "Stop reading the disc and finish the movie from what has been rescued so far",
+      busyKey: "finish-rescue",
+      icon: <Check className="size-3.5" />,
+      run: () => confirmFinishRescued(job, controls),
+    });
+  }
+  if (offerAiRepair(job)) {
+    actions.push({
+      key: "ai",
+      label: "AI estimate",
+      detail: "Find the damaged moments and price replacing them with AI frames — free, nothing is sent",
+      busyKey: "prepare-ai-repair",
+      icon: <Sparkles className="size-3.5" />,
+      run: () => void controls.prepareAiRepair(job.id),
+    });
+  }
+  if (job.recoverable && !repairing) {
+    actions.push({
+      key: "retry",
+      label: retryLabel(job),
+      detail: "Start this disc again",
+      busyKey: "retry",
+      icon: <RotateCw className="size-3.5" />,
+      run: () => void controls.retry(job.id),
+    });
+  }
+  return actions;
+}
+
+function JobActions({ job, controls, busy }: { job: Job; controls: DiscDockControls; busy: string | null }) {
+  const actions = jobActions(job, controls);
+  const [first, ...rest] = actions;
+  if (!first) return null;
+  return (
+    <>
+      <Button disabled={busy !== null} variant="outline" size="sm" className="gap-2 border-amber-400/20 text-amber-100" title={first.detail} onClick={first.run}>{busy === first.busyKey ? <Loader2 className="size-3.5 animate-spin" /> : first.icon} {first.label}</Button>
+      {rest.length > 0 && (
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button disabled={busy !== null} variant="ghost" size="sm" className="gap-1 px-2 text-muted-foreground" aria-label={`More ways to finish ${titleFor(job)}`}><MoreHorizontal className="size-4" /></Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="w-64">
+            {rest.map((action) => (
+              <DropdownMenuItem key={action.key} onSelect={action.run} className="gap-2">
+                {action.icon}
+                <span className="min-w-0"><span className="block truncate">{action.label}</span><span className="block text-xs leading-4 text-muted-foreground whitespace-normal">{action.detail}</span></span>
+              </DropdownMenuItem>
+            ))}
+          </DropdownMenuContent>
+        </DropdownMenu>
+      )}
+    </>
+  );
+}
+
 function RecentJobs({ jobs, busy, controls }: { jobs: Job[]; busy: string | null; controls: DiscDockControls }) {
   return (
     <Card className="border-white/8 bg-card shadow-none">
@@ -1025,17 +1206,16 @@ function RecentJobs({ jobs, busy, controls }: { jobs: Job[]; busy: string | null
             <div className="min-w-0 flex-1"><p className="truncate text-sm font-medium">{titleFor(job)}</p><p className="mt-1 truncate text-xs text-muted-foreground">{job.disc_type.replace("_", " ")} · {recentJobDetail(job)}</p></div>
             <div className="hidden text-right sm:block"><StateBadge state={job.state} /><p className="mt-1 text-xs text-muted-foreground">{formatDate(job.updated_at)}</p></div>
             {job.error_code === "makemkv_license" && <Button disabled={busy !== null} variant="outline" size="sm" className="gap-2 border-amber-400/20 text-amber-100" onClick={() => void controls.openMakeMKV()}><KeyRound className="size-3.5" /> Activate MakeMKV</Button>}
-            {offerDamageRecovery(job) && job.error_code !== "ai_repair_not_possible" && <Button disabled={busy !== null} variant="outline" size="sm" className="gap-2 border-amber-400/20 text-amber-100" onClick={() => confirmDamageRecovery(job, controls)}>{busy === "recover-damaged" ? <Loader2 className="size-3.5 animate-spin" /> : <Play className="size-3.5" />} Recover</Button>}
-            {offerFinishRescued(job) && <Button disabled={busy !== null} variant="outline" size="sm" className="gap-2 border-amber-400/20 text-amber-100" onClick={() => confirmFinishRescued(job, controls)}>{busy === "finish-rescue" ? <Loader2 className="size-3.5 animate-spin" /> : <Check className="size-3.5" />} Finish with what&apos;s rescued</Button>}
-            {offerAiRepair(job) && <Button disabled={busy !== null} variant="outline" size="sm" className="gap-2 border-primary/20 text-primary" onClick={() => void controls.prepareAiRepair(job.id)}>{busy === "prepare-ai-repair" ? <Loader2 className="size-3.5 animate-spin" /> : <Sparkles className="size-3.5" />} AI estimate</Button>}
+            <JobActions job={job} controls={controls} busy={busy} />
+            {job.state === "completed" && Boolean(discReadWarning(job)) && offerDamageReview(job) && <Button disabled={busy !== null} variant="outline" size="sm" className="gap-2 border-white/10" title="Decode the whole movie to find every broken part, then choose loading screens or AI frames" onClick={() => { if (window.confirm("Look through this movie for broken parts? DiscDock decodes the whole movie to find where the picture breaks up, not only where the disc gave nothing at all. It takes a few minutes, changes nothing and costs nothing. Afterwards you choose what to do with what it finds.")) void controls.reviewDamage(job.id); }}>{busy === "review-damage" ? <Loader2 className="size-3.5 animate-spin" /> : <Wrench className="size-3.5" />} Replace broken parts</Button>}
             {damageDetailsFromJob(job).choicePending && (
               <>
                 <Button disabled={busy !== null} variant="outline" size="sm" className="gap-2 border-white/10" title="Keep the movie as it was read, frozen where the disc was damaged" onClick={() => void controls.keepDamagedMovie(job.id)}>{busy === "keep-damaged-movie" && <Loader2 className="size-3.5 animate-spin" />} Keep as it is</Button>
                 <Button disabled={busy !== null} variant="outline" size="sm" className="gap-2 border-amber-400/20 text-amber-100" onClick={() => { if (window.confirm("Add loading screens to this movie? Where the disc was damaged for 2 seconds or more, it then shows a loading screen with the time the movie continues instead of a frozen picture. Only a few seconds around those moments are encoded again, and the movie as it was read is kept next to it.")) void controls.addLoadingScreens(job.id); }}>{busy === "loading-screens" ? <Loader2 className="size-3.5 animate-spin" /> : <Film className="size-3.5" />} Add loading screens</Button>
+                {aiEstimateFromJob(job) && <Button disabled={busy !== null} size="sm" className="gap-2 bg-primary text-primary-foreground" onClick={() => { const plan = aiEstimateFromJob(job); if (plan && window.confirm(`Replace the broken parts with AI-generated frames? This sends pictures from either side of each damaged moment to OpenAI and costs at most $${plan.estimated_max_cost_usd.toFixed(2)}. You review the estimate before anything is sent. The movie without AI frames is kept next to the repaired one.`)) void controls.prepareAiRepair(job.id); }}>{busy === "prepare-ai-repair" ? <Loader2 className="size-3.5 animate-spin" /> : <Sparkles className="size-3.5" />} Replace with AI · up to ${aiEstimateFromJob(job)!.estimated_max_cost_usd.toFixed(2)}</Button>}
               </>
             )}
             {isCompletedDuplicate(job) && <Button disabled={busy !== null} variant="outline" size="sm" className="gap-2 border-primary/25 text-primary" title="Rip more titles of this disc into the folder it was completed in" onClick={() => void controls.addTitlesToCompleted(job.id)}>{busy === "add-titles" ? <Loader2 className="size-3.5 animate-spin" /> : <ListChecks className="size-3.5" />} Add titles to the existing folder</Button>}
-            {job.recoverable && <Button disabled={busy !== null} variant="ghost" size="sm" onClick={() => void controls.retry(job.id)}>{retryLabel(job)}</Button>}
           </div>
         ))}
       </CardContent>

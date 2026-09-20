@@ -387,6 +387,16 @@ async def add_loading_screens(job_id: str):
         raise HTTPException(409, str(error)) from error
 
 
+@app.post("/api/v1/jobs/{job_id}/damage/review", status_code=202)
+async def review_damaged_movie(job_id: str):
+    try:
+        return await SERVICE.review_damaged_movie(job_id)
+    except LookupError as error:
+        raise HTTPException(404, str(error)) from error
+    except RuntimeError as error:
+        raise HTTPException(409, str(error)) from error
+
+
 @app.post("/api/v1/jobs/{job_id}/damage/keep")
 async def keep_damaged_movie(job_id: str):
     try:

@@ -38,6 +38,7 @@ from .damage_screens import (
     unrepaired_copy_path,
 )
 from .database import Database, utc_now
+from .disc_files import DiscContents, DiscEntry, check_backup, describe_contents, list_drive_files
 from .disc_rescue import FINISHED, PENDING, RescueMap, merge_rescue_images
 from .drives import DriveControl, DriveMonitor
 from .files import (
@@ -60,6 +61,7 @@ from .media_tools import (
     DiscAuthenticationRequired,
     DriveNotResponding,
     DvdSectorRescue,
+    FfmpegDvdRecovery,
     HandBrakeTranscoder,
     VlcDvdRecovery,
     describe_rescue_progress,
@@ -72,6 +74,7 @@ from .models import (
     JobState,
     MediaKind,
     MetadataCandidate,
+    TitleInfo,
 )
 from .musicbrainz import (
     MAX_COVER_BYTES,
@@ -83,7 +86,14 @@ from .musicbrainz import (
     MusicBrainzUnavailable,
 )
 from .notifications import NotificationService
-from .optical import SECTOR_SIZE
+from .optical import (
+    SECTOR_SIZE,
+    OpticalError,
+    dvd_title_video_ranges,
+    dvd_titles,
+    dvd_video_scrambled,
+    read_video_ts_files,
+)
 from .processes import ProcessFailure, ProcessRunner, begin_captures, cancel_captures
 from .secrets import SecretStore
 from .settings import AppSettings, SettingsStore
@@ -320,6 +330,29 @@ RESCUE_QUALITY_WARNING = (
     "Unreadable disc blocks were skipped. The movie may briefly freeze, show blocky pictures, "
     "or jump forward where the disc is damaged."
 )
+
+# Ways to get the movie out of a rescued disc image, fastest first. MakeMKV keeps
+# the most (chapters, every track) and is quickest when the disc's navigation
+# still makes sense to it; FFmpeg ignores that navigation and copies the movie's
+# own sectors in about a minute; VLC plays the disc and is the slowest by far, so
+# it is only asked once nothing else is left. DiscDock walks the list by itself.
+EXTRACTION_METHODS = ("makemkv", "ffmpeg", "vlc")
+
+# Choosing "Finish with what's rescued" accepts the movie as it came back, so the check
+# that a copy is long enough only has to catch one that stopped almost immediately.
+FINISH_NOW_MINIMUM_SHARE = 0.1
+
+# Work on a movie that is already in the library: the disc is long gone, so these
+# stages never hold a drive and never stop the next disc from being ripped.
+LIBRARY_REPAIR_STAGES = {"damage_screens", "damage_scan"}
+
+
+def _link_or_copy(source: Path, target: Path) -> None:
+    """Put ``source`` at ``target`` without using disk space where the file system allows it."""
+    try:
+        os.link(source, target)
+    except OSError:
+        shutil.copy2(source, target)
 
 
 def _format_bytes(value: int) -> str:
@@ -628,8 +661,8 @@ class DiscDockService:
 
     def active_job_for_drive(self, drive_id: str) -> dict[str, Any] | None:
         for job in self.database.list_jobs(250):
-            # Adding loading screens to a finished movie does not use the drive.
-            if job.get("stage") == "damage_screens" and job.get("completed_at"):
+            # Repairing a finished movie in the library does not use the drive.
+            if job.get("stage") in LIBRARY_REPAIR_STAGES and job.get("completed_at"):
                 continue
             if job["drive_id"] == drive_id and job["state"] in {state.value for state in ACTIVE_JOB_STATES}:
                 return job
@@ -1071,6 +1104,120 @@ class DiscDockService:
         )
         return scan
 
+    async def _look_at_data_disc(self, job_id: str, drive: DriveInfo) -> None:
+        """List what a data disc holds, so it can be recognised before it is backed up.
+
+        Windows has the disc mounted, so its own file system answers for ISO 9660,
+        Joliet and UDF alike. A disc it cannot read is still backed up as an image;
+        only the listing is missing.
+        """
+        self.database.update_job(job_id, status_detail="Looking at what is on the disc")
+        try:
+            contents = await asyncio.to_thread(list_drive_files, drive.letter)
+        except (OSError, ValueError) as error:
+            await asyncio.to_thread(
+                self._append_log, job_id, f"The files on the disc could not be listed: {error}"
+            )
+            self._merge_job_metadata(
+                job_id,
+                {"disc_contents": {"kind": "files", "summary": "Windows could not list the files on this disc.",
+                                   "file_count": 0, "total_bytes": 0, "entries": [], "top_level": [],
+                                   "unreadable": True}},
+            )
+            return
+        described = describe_contents(contents, drive.volume_label)
+        self._merge_job_metadata(job_id, {"disc_contents": described})
+        await asyncio.to_thread(
+            self._append_log,
+            job_id,
+            f"The disc holds {contents.file_count} files, {_format_bytes(contents.total_bytes)}"
+            f" · {described['summary']}"
+            + (f" {contents.note}" if contents.note else ""),
+        )
+
+    async def _back_up_data_disc(
+        self, job_id: str, drive: DriveInfo, job: dict[str, Any], staging: Path
+    ) -> None:
+        """Copy the whole disc into an image, then check the image holds every file the disc showed."""
+        name = safe_component(str(job.get("title") or job.get("disc_label") or "Disc backup"))
+        image = staging / f"{name}.iso"
+        described = (job.get("metadata") or {}).get("disc_contents")
+        described = described if isinstance(described, dict) else {}
+        await DataDiscRipper(self.runner).rip(
+            job_id, drive.letter, image, callback=lambda event: self._process_event(job_id, event)
+        )
+        listed = [
+            DiscEntry(str(item.get("path") or ""), int(item.get("size") or 0))
+            for item in described.get("entries") or []
+            if isinstance(item, dict) and item.get("path")
+        ]
+        if listed:
+            self.database.update_job(job_id, status_detail="Checking the backup against the disc")
+            contents = DiscContents(listed, int(described.get("total_bytes") or 0), bool(described.get("truncated")))
+            check = await asyncio.to_thread(check_backup, contents, image)
+            if not check.complete:
+                raise RuntimeError(f"The backup does not hold everything on the disc: {check.reason}")
+            await asyncio.to_thread(
+                self._append_log,
+                job_id,
+                f"The backup holds all {check.files_on_disc} files of the disc "
+                f"({check.files_in_image} in the image's own file system)",
+            )
+        else:
+            await asyncio.to_thread(
+                self._append_log,
+                job_id,
+                "The disc's files could not be listed, so the backup is checked by its size only",
+            )
+        await asyncio.to_thread(self._write_backup_notes, staging, image, job, described)
+
+    @staticmethod
+    def _write_backup_notes(staging: Path, image: Path, job: dict[str, Any], described: dict[str, Any]) -> None:
+        """Write what is in the backup and how to use it, next to the image."""
+        title = str(job.get("title") or job.get("disc_label") or "This disc")
+        kind = str(described.get("kind") or "files")
+        entries = [item for item in described.get("entries") or [] if isinstance(item, dict)]
+        lines = [
+            f"{title}",
+            f"Disc label: {job.get('disc_label') or 'none'}",
+            f"Backed up: {utc_now()}",
+            f"Files: {described.get('file_count') or len(entries)}",
+            f"Size: {_format_bytes(int(described.get('total_bytes') or 0))}",
+            "",
+        ]
+        if described.get("note"):
+            lines += [str(described["note"]), ""]
+        lines += [f"{item.get('path')}\t{item.get('size')}" for item in entries]
+        (staging / "Disc contents.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        playing = (
+            [
+                "This backup is the disc itself, as an image file.",
+                "",
+                "To play or install it:",
+                f"  1. Double-click {image.name}. Windows attaches it as a drive.",
+                "  2. Open that drive and run the game's setup or autorun program.",
+                "  3. Leave the drive attached while you play, in case the game reads from it.",
+                "  4. When you are done, right-click the drive and choose Eject.",
+                "",
+                "Some discs check for the original disc in the drive with their own protection.",
+                "Those refuse to run from any backup; DiscDock copies the disc, it does not remove protection.",
+            ]
+            if kind in {"game", "software"}
+            else [
+                "This backup is the disc itself, as an image file.",
+                "",
+                "To open it:",
+                f"  1. Double-click {image.name}. Windows attaches it as a drive.",
+                "  2. Copy what you need out of that drive.",
+                "  3. When you are done, right-click the drive and choose Eject.",
+            ]
+        )
+        playing += [
+            "",
+            "Disc contents.txt lists every file in this backup, so you can search it without opening the image.",
+        ]
+        (staging / "How to use this backup.txt").write_text("\n".join(playing) + "\n", encoding="utf-8")
+
     async def _scan_rescued_structures(self, job_id: str, drive: DriveInfo, settings: AppSettings) -> DiscScan:
         """Read a damaged disc's file system and navigation data, then let MakeMKV list the titles from that copy."""
         job = self.database.get_job(job_id) or {}
@@ -1103,10 +1250,24 @@ class DiscDockService:
             await self._run_sector_rescue(job_id, drive, settings, image, None, whole_disc=True, extra_seconds=0)
             scan = await self._scan_image(job_id, settings, image)
         if scan is None:
-            raise RuntimeError("MakeMKV found no titles in the rescued copy of the disc either")
-        await asyncio.to_thread(
-            self._append_log, job_id, f"MakeMKV found {len(scan.titles)} titles in the rescued copy of the disc"
-        )
+            # MakeMKV calls a title with damaged navigation fake and then lists none at all.
+            # The disc's own tables still name the titles, and FFmpeg can copy one out of the image.
+            scan = await asyncio.to_thread(self._titles_from_disc_tables, image if image.is_file() else partial)
+            if scan is None:
+                raise RuntimeError("MakeMKV found no titles in the rescued copy of the disc either")
+            await asyncio.to_thread(
+                self._append_log,
+                job_id,
+                f"MakeMKV found no titles; the disc's own tables list {len(scan.titles)}: "
+                + ", ".join(
+                    f"title {title.disc_title_number} ({title.duration_seconds // 60} min)"
+                    for title in scan.titles[:8]
+                ),
+            )
+        else:
+            await asyncio.to_thread(
+                self._append_log, job_id, f"MakeMKV found {len(scan.titles)} titles in the rescued copy of the disc"
+            )
         self.database.update_job(
             job_id,
             state=JobState.INSPECTING,
@@ -1115,6 +1276,48 @@ class DiscDockService:
             progress=0,
         )
         return scan
+
+    @staticmethod
+    def _titles_from_disc_tables(path: Path) -> DiscScan | None:
+        """The titles a rescued DVD image lists in its own navigation, for a disc MakeMKV gave up on.
+
+        Each title is described well enough to pick one and copy its sectors with
+        FFmpeg: how long it plays, how many chapters it has, and how much video it
+        holds. MakeMKV never sees these titles, so nothing else can extract them.
+        """
+        try:
+            with path.open("rb") as handle:
+
+                def read(lba: int, count: int) -> bytes:
+                    handle.seek(lba * SECTOR_SIZE)
+                    return handle.read(count * SECTOR_SIZE).ljust(count * SECTOR_SIZE, b"\0")
+
+                total_sectors = path.stat().st_size // SECTOR_SIZE
+                files = read_video_ts_files(read, total_sectors)
+                found = dvd_titles(read, files)
+                titles: list[TitleInfo] = []
+                for index, title in enumerate(sorted(found, key=lambda item: -item.duration_seconds)):
+                    ranges = dvd_title_video_ranges(read, total_sectors, title.number)
+                    size = sum(end - start for start, end in ranges) * SECTOR_SIZE
+                    if title.duration_seconds <= 0 or size <= 0:
+                        continue
+                    titles.append(
+                        TitleInfo(
+                            id=index,
+                            disc_title_number=title.number,
+                            name=f"Title {title.number}",
+                            duration_seconds=title.duration_seconds,
+                            size_bytes=size,
+                            chapters=title.chapters,
+                            filename=f"title_t{index:02d}.mkv",
+                            description="Listed in the disc's own navigation, not by MakeMKV",
+                        )
+                    )
+        except (OpticalError, OSError, ValueError):
+            return None
+        if not titles:
+            return None
+        return DiscScan(title_count=len(titles), titles=titles)
 
     async def _scan_image(self, job_id: str, settings: AppSettings, path: Path) -> DiscScan | None:
         """MakeMKV's titles in a (partly) rescued disc image, or None when it finds none."""
@@ -1198,6 +1401,8 @@ class DiscDockService:
                     self.database.replace_tracks(job_id, tracks)
                 elif drive.disc_kind == DiscKind.AUDIO_CD or drive.disc_kind == DiscKind.DATA:
                     tracks = []
+                    if drive.disc_kind == DiscKind.DATA:
+                        await self._look_at_data_disc(job_id, drive)
 
                 fingerprint = self._disc_fingerprint(drive, scan, job_id)
                 duplicate = self.database.query(
@@ -1309,7 +1514,7 @@ class DiscDockService:
                     or (
                         MediaKind.MUSIC
                         if drive.disc_kind == DiscKind.AUDIO_CD
-                        else MediaKind.DATA
+                        else MediaKind.OTHER
                         if drive.disc_kind == DiscKind.DATA
                         else MediaKind.UNKNOWN
                     )
@@ -1347,17 +1552,47 @@ class DiscDockService:
                     ]
                     self.database.replace_tracks(job_id, tracks)
 
+                if drive.disc_kind == DiscKind.DATA:
+                    # Nobody can name a game or a folder of files from a volume label alone,
+                    # so the disc's own files are shown and the backup waits for a name.
+                    described = metadata.get("disc_contents") or {}
+                    files = int(described.get("file_count") or 0)
+                    self.database.update_job(
+                        job_id,
+                        state=JobState.AWAITING_INPUT,
+                        stage="awaiting_input",
+                        status_detail=(
+                            f"Look at the {files} files on this disc and name the backup"
+                            if files
+                            else "Name this disc to back it up"
+                        ),
+                        recoverable=1,
+                    )
+                    await self.notifications.send(
+                        job_id,
+                        "attention",
+                        "A disc is waiting to be named",
+                        f"{title} holds {files} files. Name it in DiscDock and it is backed up.",
+                    )
+                    return
+
                 needs_identification = bool(
                     is_video and settings.omdb_enabled and candidate is None
                 )
                 short_titles_only = bool(metadata.get("short_titles_only"))
-                if (manual or needs_identification or short_titles_only) and is_video:
+                # "Always choose titles" in Settings holds every disc here, with the titles
+                # between the minimum and maximum length ready to tick, as the Choose titles
+                # button does for one disc.
+                always_choosing = settings.always_choose_titles
+                if (manual or needs_identification or short_titles_only or always_choosing) and is_video:
                     status_detail = (
                         "Every title is shorter than the minimum length in Settings — choose what to rip"
                         if short_titles_only
                         else "No OMDb match found — search or enter the title"
                         if needs_identification
                         else "Review the title and choose what to rip"
+                        if manual
+                        else "Choose which titles to rip, as set in Settings"
                     )
                     self.database.update_job(
                         job_id,
@@ -1458,6 +1693,7 @@ class DiscDockService:
             or current.volume_label.casefold() == str(job["disc_label"]).casefold()
         )
         partial = DvdSectorRescue.artifact_paths(image)["partial"]
+        minimum_share = 0.8
         recovery = ((self.database.get_job(job_id) or job).get("metadata") or {}).get("recovery")
         if isinstance(recovery, dict) and recovery.get("finish_without_reading") and (
             image.is_file() or partial.is_file()
@@ -1465,11 +1701,16 @@ class DiscDockService:
             # The user chose to finish with what was rescued, for example while
             # the drive is stuck after a hardware fault. A later retry reads again.
             needs_reading = False
+            # Asking to finish now means accepting whatever the disc gave, holes and all.
+            minimum_share = FINISH_NOW_MINIMUM_SHARE
             if not image.is_file():
                 await asyncio.to_thread(os.replace, partial, image)
             self._update_recovery_metadata(job_id, finish_without_reading=False)
             await asyncio.to_thread(
-                self._append_log, job_id, "Finishing with the sectors rescued so far; the disc is not read again"
+                self._append_log,
+                job_id,
+                "Finishing with the sectors rescued so far; the disc is not read again, and the movie is kept "
+                "however much of it came back",
             )
         elif not image.is_file():
             needs_reading = True
@@ -1504,27 +1745,73 @@ class DiscDockService:
                     + RESCUE_STOP_REASONS.get(str(summary.get("stop_reason") or ""), "")
                 ),
             )
+        # The ways to finish the movie, in the order they take: reading the image
+        # first, then the rest of the disc, and playing it out with VLC last.
+        # DiscDock moves on to the next by itself, so nothing waits for a click.
+        problems: list[str] = []
         try:
-            await self._extract_title_from_image(job_id, drive.letter, settings, image, staging, main_track)
-        except MakeMKVLicenseError:
+            await self._extract_title_from_image(
+                job_id, drive.letter, settings, image, staging, main_track,
+                methods=("makemkv", "ffmpeg"), problems=problems, minimum_share=minimum_share,
+            )
+            return
+        except (MakeMKVLicenseError, ImageNotDecryptable):
             raise
         except (ProcessFailure, RuntimeError) as error:
-            # The image holds the movie and the disc's navigation. Should MakeMKV
-            # need more of the disc, read the rest once and extract again.
-            if (
-                isinstance(error, ImageNotDecryptable)
-                or not disc_present
-                or await asyncio.to_thread(self._rescue_swept_whole_disc, image)
-            ):
-                raise
+            problem = error
+        # The image holds the movie and the disc's navigation. Should MakeMKV
+        # need more of the disc, read the rest once and extract again.
+        if disc_present and not await asyncio.to_thread(self._rescue_swept_whole_disc, image):
             await asyncio.to_thread(
                 self._append_log,
                 job_id,
-                f"MakeMKV could not use the image with only the movie read ({error}); reading the rest of the disc once",
+                f"The movie could not be taken out of the image with only the movie read ({problem}); "
+                "reading the rest of the disc once",
             )
             self.database.update_job(job_id, status_detail="Reading the rest of the disc for MakeMKV")
             await self._run_sector_rescue(job_id, drive, settings, image, main_track, whole_disc=True, extra_seconds=0)
-            await self._extract_title_from_image(job_id, drive.letter, settings, image, staging, main_track)
+            try:
+                await self._extract_title_from_image(
+                    job_id, drive.letter, settings, image, staging, main_track,
+                    methods=("makemkv", "ffmpeg"), problems=problems, minimum_share=minimum_share,
+                )
+                return
+            except (MakeMKVLicenseError, ImageNotDecryptable):
+                raise
+            except (ProcessFailure, RuntimeError) as error:
+                problem = error
+        # An image finished early, for example with "Finish with what's rescued", can be missing
+        # most of the movie. Reading the spots that were skipped beats guessing at the rest.
+        if disc_present and await asyncio.to_thread(self._rescue_has_retry_work, image, settings):
+            await asyncio.to_thread(
+                self._append_log,
+                job_id,
+                f"The movie could not be taken out of the image ({problem}); the disc still has unread spots, "
+                "so they are read before trying again",
+            )
+            self.database.update_job(job_id, status_detail="Reading the spots that were skipped")
+            await self._run_sector_rescue(job_id, drive, settings, image, main_track)
+            try:
+                await self._extract_title_from_image(
+                    job_id, drive.letter, settings, image, staging, main_track,
+                    methods=("makemkv", "ffmpeg"), problems=problems, minimum_share=minimum_share,
+                )
+                return
+            except (MakeMKVLicenseError, ImageNotDecryptable):
+                raise
+            except (ProcessFailure, RuntimeError) as error:
+                problem = error
+        if (self.database.get_job(job_id) or {}).get("disc_type") != DiscKind.DVD:
+            raise problem
+        await asyncio.to_thread(
+            self._append_log,
+            job_id,
+            "Nothing else is left to read; letting VLC play the movie out of the image as a last resort",
+        )
+        await self._extract_title_from_image(
+            job_id, drive.letter, settings, image, staging, main_track,
+            methods=("vlc",), problems=problems, minimum_share=minimum_share,
+        )
 
     @staticmethod
     def _rescue_swept_whole_disc(image: Path) -> bool:
@@ -1804,7 +2091,18 @@ class DiscDockService:
         image: Path,
         staging: Path,
         main_track: dict[str, Any],
+        *,
+        methods: tuple[str, ...] = EXTRACTION_METHODS,
+        problems: list[str] | None = None,
+        minimum_share: float = 0.8,
     ) -> None:
+        """Get the movie out of a rescued disc image, trying ``methods`` in order.
+
+        Each method that cannot finish hands over to the next one by itself, so a
+        damaged disc is not left waiting for someone to pick the next step. A
+        shared ``problems`` list collects what every method ran into, so the job
+        can say what was tried if none of them works.
+        """
         client = self._make_mkv(settings)
         if hasattr(client, "no_output_timeout"):
             # MakeMKV can work through a large disc image for minutes without printing anything.
@@ -1845,6 +2143,70 @@ class DiscDockService:
         extracted = staging / ".rescued-title.partial"
         if extracted.exists():
             await asyncio.to_thread(shutil.rmtree, extracted)
+        is_dvd = (self.database.get_job(job_id) or {}).get("disc_type") == DiscKind.DVD
+        problems = problems if problems is not None else []
+        extraction_done = False
+        if "makemkv" in methods:
+            extraction_done = await self._extract_image_with_makemkv(
+                job_id,
+                letter,
+                settings,
+                image,
+                extracted,
+                main_track,
+                client,
+                source,
+                min_length,
+                stuck,
+                repeats,
+                scan_event,
+                extraction_event,
+                problems,
+                is_dvd=is_dvd,
+                last=not [method for method in methods if method != "makemkv"] or not is_dvd,
+            )
+        if not extraction_done and is_dvd and "ffmpeg" in methods:
+            extraction_done = await self._extract_image_with_ffmpeg(
+                job_id, settings, image, extracted, main_track, extraction_event, problems, minimum_share
+            )
+        if not extraction_done and is_dvd and "vlc" in methods:
+            extraction_done = await self._extract_image_with_vlc(
+                job_id, letter, settings, image, extracted, main_track, extraction_event, problems, minimum_share
+            )
+        if not extraction_done:
+            raise RuntimeError(
+                "The movie could not be taken out of the rescued disc image. "
+                + " ".join(dict.fromkeys(problems))
+            )
+        for path in extracted.iterdir():
+            os.replace(path, staging / path.name)
+        extracted.rmdir()
+
+    async def _extract_image_with_makemkv(
+        self,
+        job_id: str,
+        letter: str,
+        settings: AppSettings,
+        image: Path,
+        extracted: Path,
+        main_track: dict[str, Any],
+        client: MakeMKVClient,
+        source: str,
+        min_length: int,
+        stuck: list[str],
+        repeats: dict[tuple[str, ...], int],
+        scan_event: Callable[[dict], Awaitable[None]],
+        extraction_event: Callable[[dict], Awaitable[None]],
+        problems: list[str],
+        *,
+        is_dvd: bool,
+        last: bool,
+    ) -> bool:
+        """Let MakeMKV extract the movie: the fastest method, and the one that keeps the most.
+
+        Returns whether it finished. ``last`` raises instead of handing over when
+        no other method can read this disc's image.
+        """
         self.database.update_job(
             job_id, status_detail="Finding the movie in the rescued disc image", progress=85
         )
@@ -1894,8 +2256,7 @@ class DiscDockService:
         except MakeMKVLicenseError:
             raise
         except (ProcessFailure, RuntimeError) as error:
-            job = self.database.get_job(job_id) or {}
-            if stuck and job.get("disc_type") != DiscKind.DVD:
+            if stuck and not is_dvd:
                 # MakeMKV cannot decrypt this Blu-ray from a plain image. With the
                 # discatt.dat its own backup saves from the drive, it can.
                 repeats.clear()
@@ -1914,34 +2275,144 @@ class DiscDockService:
                     scan_event,
                     extraction_event,
                 )
-            # VLC reads DVD images only; a Blu-ray image has no second extractor.
-            elif job.get("disc_type") != DiscKind.DVD or not settings.vlc_path or not Path(settings.vlc_path).is_file():
+                return True
+            if last:
+                # A Blu-ray image has no second reader; only MakeMKV decrypts one.
                 raise RuntimeError(
                     f"MakeMKV could not extract the movie from the rescued disc image: {error}"
                 ) from error
-            else:
-                await asyncio.to_thread(
-                    self._append_log,
-                    job_id,
-                    f"MakeMKV could not extract the rescued image; trying VLC: {error}",
-                )
-                if extracted.exists():
-                    await asyncio.to_thread(shutil.rmtree, extracted)
-                await VlcDvdRecovery(settings.vlc_path, settings.ffprobe_path, self.runner).recover(
-                    job_id,
-                    letter,
-                    extracted,
-                    self._dvd_recovery_title_number(job_id, main_track, settings),
-                    int(main_track.get("chapters") or 1),
-                    int(main_track.get("duration_seconds") or 0),
-                    int(main_track.get("size_bytes") or 0),
-                    settings.rip_timeout_seconds,
-                    callback=extraction_event,
-                    source_image=image,
-                )
-        for path in extracted.iterdir():
-            os.replace(path, staging / path.name)
-        extracted.rmdir()
+            problems.append(f"MakeMKV could not use the rescued image ({error}).")
+            await asyncio.to_thread(
+                self._append_log, job_id, f"MakeMKV could not extract the rescued image: {error}"
+            )
+            return False
+        return True
+
+    async def _extract_image_with_ffmpeg(
+        self,
+        job_id: str,
+        settings: AppSettings,
+        image: Path,
+        extracted: Path,
+        main_track: dict[str, Any],
+        extraction_event: Callable[[dict], Awaitable[None]],
+        problems: list[str],
+        minimum_share: float = 0.8,
+    ) -> bool:
+        """Copy the movie's own sectors out of a rescued DVD image with FFmpeg.
+
+        This needs none of the disc's navigation, which is what MakeMKV and VLC
+        stumble over, and it copies at disk speed.
+        """
+        if not settings.ffmpeg_path or not Path(settings.ffmpeg_path).is_file():
+            problems.append("FFmpeg is not set up, so the movie's sectors could not be copied.")
+            return False
+        title_number = self._dvd_recovery_title_number(job_id, main_track, settings)
+        ranges, scrambled = await asyncio.to_thread(
+            self._dvd_movie_sectors, image, title_number, str(main_track.get("segment_map") or "")
+        )
+        if not ranges:
+            problems.append("The movie's own sectors could not be found in the rescued image.")
+            return False
+        if scrambled:
+            # Without the disc's keys these sectors are noise; MakeMKV and VLC decrypt, DiscDock does not.
+            problems.append("The rescued image is still scrambled, so only a player that decrypts DVDs can read it.")
+            await asyncio.to_thread(
+                self._append_log,
+                job_id,
+                "The rescued image is still scrambled, so its sectors cannot be copied directly",
+            )
+            return False
+        megabytes = sum(end - start for start, end in ranges) * SECTOR_SIZE / 1024**2
+        await asyncio.to_thread(
+            self._append_log,
+            job_id,
+            f"Copying the movie's own sectors from the rescued image with FFmpeg ({megabytes:,.0f} MB, "
+            f"DVD title {title_number})",
+        )
+        self.database.update_job(job_id, status_detail="Copying the movie out of the rescued disc image")
+        if extracted.exists():
+            await asyncio.to_thread(shutil.rmtree, extracted)
+        try:
+            await FfmpegDvdRecovery(settings.ffmpeg_path, settings.ffprobe_path, self.runner).recover(
+                job_id,
+                image,
+                ranges,
+                extracted,
+                int(main_track.get("duration_seconds") or 0),
+                settings.rip_timeout_seconds,
+                callback=extraction_event,
+                minimum_share=minimum_share,
+            )
+        except (ProcessFailure, FileNotFoundError, ValueError, OSError) as error:
+            problems.append(f"FFmpeg could not copy the movie ({error}).")
+            await asyncio.to_thread(
+                self._append_log, job_id, f"FFmpeg could not copy the movie from the rescued image: {error}"
+            )
+            return False
+        await asyncio.to_thread(
+            self._append_log, job_id, "FFmpeg copied the movie out of the rescued disc image"
+        )
+        return True
+
+    async def _extract_image_with_vlc(
+        self,
+        job_id: str,
+        letter: str,
+        settings: AppSettings,
+        image: Path,
+        extracted: Path,
+        main_track: dict[str, Any],
+        extraction_event: Callable[[dict], Awaitable[None]],
+        problems: list[str],
+        minimum_share: float = 0.8,
+    ) -> bool:
+        """Let VLC play the movie out of a rescued DVD image: the slowest method, so it comes last."""
+        if not settings.vlc_path or not Path(settings.vlc_path).is_file():
+            problems.append("VLC is not installed, so the movie could not be played out of the image.")
+            return False
+        await asyncio.to_thread(
+            self._append_log, job_id, "Playing the movie out of the rescued disc image with VLC"
+        )
+        if extracted.exists():
+            await asyncio.to_thread(shutil.rmtree, extracted)
+        try:
+            await VlcDvdRecovery(settings.vlc_path, settings.ffprobe_path, self.runner).recover(
+                job_id,
+                letter,
+                extracted,
+                self._dvd_recovery_title_number(job_id, main_track, settings),
+                int(main_track.get("chapters") or 1),
+                int(main_track.get("duration_seconds") or 0),
+                int(main_track.get("size_bytes") or 0),
+                settings.rip_timeout_seconds,
+                callback=extraction_event,
+                source_image=image,
+                minimum_share=minimum_share,
+            )
+        except (ProcessFailure, FileNotFoundError, ValueError, OSError) as error:
+            problems.append(f"VLC could not read the movie ({error}).")
+            await asyncio.to_thread(
+                self._append_log, job_id, f"VLC could not read the movie from the rescued image: {error}"
+            )
+            return False
+        return True
+
+    @staticmethod
+    def _dvd_movie_sectors(image: Path, title_number: int, segment_map: str) -> tuple[list[tuple[int, int]], bool]:
+        """The sectors of the selected DVD title in a rescued image, and whether they are still scrambled."""
+        try:
+            with image.open("rb") as handle:
+
+                def read(lba: int, count: int) -> bytes:
+                    handle.seek(lba * SECTOR_SIZE)
+                    return handle.read(count * SECTOR_SIZE).ljust(count * SECTOR_SIZE, b"\0")
+
+                total_sectors = image.stat().st_size // SECTOR_SIZE
+                ranges = dvd_title_video_ranges(read, total_sectors, title_number, segment_map)
+                return ranges, bool(ranges) and dvd_video_scrambled(read, ranges)
+        except (OpticalError, OSError, ValueError):
+            return [], False
 
     def _drive_with_disc(self, job_id: str, letter: str) -> DriveInfo | None:
         """The connected drive with this letter, if the job's disc is in it."""
@@ -2218,10 +2689,7 @@ class DiscDockService:
             )
             await asyncio.gather(*lookups, return_exceptions=True)
         elif disc_kind == DiscKind.DATA:
-            iso = staging / f"{safe_component(job['disc_label'])}.iso"
-            await DataDiscRipper(self.runner).rip(
-                job_id, drive.letter, iso, callback=lambda event: self._process_event(job_id, event)
-            )
+            await self._back_up_data_disc(job_id, drive, job, staging)
         else:
             results = await self._make_mkv(settings).rip(
                 job_id,
@@ -2470,7 +2938,11 @@ class DiscDockService:
         if job:
             metadata = dict(job.get("metadata") or {})
             previous = metadata.get("damage") if isinstance(metadata.get("damage"), dict) else {}
-            kept = {key: previous[key] for key in ("kept_copy", "loading_screen_method") if key in previous}
+            kept = {
+                key: previous[key]
+                for key in ("kept_copy", "loading_screen_method", "reviewed_at")
+                if key in previous
+            }
             metadata["damage"] = {**kept, **(details or {}), "analyzed_at": utc_now(), "moments": recorded}
             self.database.update_job(job_id, metadata_json=json.dumps(metadata, ensure_ascii=False))
         return recorded
@@ -2876,8 +3348,10 @@ class DiscDockService:
         drive = drive or self._placeholder_drive(job)
         tracks = self.database.list_tracks(job_id)
         if not any(track["selected"] for track in tracks):
-            if job.get("error_code") != "disc_unreadable":
+            if tracks and job.get("error_code") != "disc_unreadable":
                 raise RuntimeError("This job has no selected movie title to recover")
+            # Nothing was ever listed for this disc: start again from its file system,
+            # which also finds the titles MakeMKV refuses to report.
             return await self._recover_before_titles(job_id, job, drive)
 
         requested_at = utc_now()
@@ -3175,7 +3649,7 @@ class DiscDockService:
             raise LookupError("Job not found")
         if job["disc_type"] not in {DiscKind.DVD, DiscKind.BLURAY}:
             raise RuntimeError("AI frame repair is available for DVDs and Blu-rays only")
-        if not _job_reported_damage(job):
+        if not _job_reported_damage(job) and not _damage_moments_for_job(job):
             raise RuntimeError("This job has not reported an unreadable video section")
         settings = self._settings_for_job(job)
         if not settings.ai_repair_enabled:
@@ -3192,6 +3666,9 @@ class DiscDockService:
             raise RuntimeError("AI repair is already prepared or running for this job")
         if plan and plan.get("status") == "applied":
             raise RuntimeError("AI repair was already applied to this job")
+        if job["state"] == JobState.COMPLETED and job.get("output_path"):
+            # A finished movie is repaired where it lies, from the estimate the damage review worked out.
+            return await self._review_library_ai_repair(job_id, job, settings, metadata, plan)
         if (
             plan
             and job["state"] in {JobState.FAILED, JobState.CANCELLED, JobState.INTERRUPTED}
@@ -3276,6 +3753,21 @@ class DiscDockService:
         self._track_job_task(job_id, drive.id, task)
         return self.database.get_job(job_id) or job
 
+    @staticmethod
+    def _replace_movie_in_library(staging: Path, destination: Path, previous: Path) -> Path:
+        """Move the repaired movie into the library folder it came from, over the file it replaces."""
+        moved: list[str] = []
+        for path in sorted(staging.iterdir()):
+            if path.is_dir():
+                continue
+            os.replace(path, destination / path.name)
+            moved.append(path.name)
+        if previous.is_file() and previous.name not in moved:
+            # The repaired movie was named differently; the file it replaces goes.
+            previous.unlink()
+        shutil.rmtree(staging, ignore_errors=True)
+        return destination
+
     async def _finalize_ai_repair(
         self, job_id: str, settings: AppSettings, repaired: Path, plan: dict[str, Any]
     ) -> None:
@@ -3300,26 +3792,34 @@ class DiscDockService:
         media_kind = MediaKind(job["media_kind"])
         directories = settings.resolved_directories()
         library_root = directories["completed"]
-        duplicate_policy = settings.duplicate_policy
-        if duplicate_policy in {"ask", "skip"}:
-            duplicate_policy = "keep_both"
-        destination = output_folder(
-            library_root,
-            media_kind,
-            job["title"],
-            job["year"],
-            job["fingerprint"],
-            duplicate_policy=duplicate_policy,
-            include_category=True,
-        )
         staging = Path(job["staging_path"])
-        await asyncio.to_thread(rename_video_outputs, staging, destination.name, media_kind)
-        finalized = await finalize_directory(
-            staging,
-            destination,
-            keep_source=False,
-            replace_existing=duplicate_policy == "replace",
-        )
+        library_movie = Path(str(plan.get("library_path") or ""))
+        if plan.get("library_path") and library_movie.parent.is_dir():
+            # The movie was repaired where it already lived: the repaired file takes its
+            # place in that folder and everything else in there is left alone.
+            destination = library_movie.parent
+            await asyncio.to_thread(rename_video_outputs, staging, destination.name, media_kind)
+            finalized = await asyncio.to_thread(self._replace_movie_in_library, staging, destination, library_movie)
+        else:
+            duplicate_policy = settings.duplicate_policy
+            if duplicate_policy in {"ask", "skip"}:
+                duplicate_policy = "keep_both"
+            destination = output_folder(
+                library_root,
+                media_kind,
+                job["title"],
+                job["year"],
+                job["fingerprint"],
+                duplicate_policy=duplicate_policy,
+                include_category=True,
+            )
+            await asyncio.to_thread(rename_video_outputs, staging, destination.name, media_kind)
+            finalized = await finalize_directory(
+                staging,
+                destination,
+                keep_source=False,
+                replace_existing=duplicate_policy == "replace",
+            )
         self.database.update_job(
             job_id,
             state=JobState.COMPLETED,
@@ -3457,6 +3957,64 @@ class DiscDockService:
             or job
         )
 
+    async def _review_library_ai_repair(
+        self,
+        job_id: str,
+        job: dict[str, Any],
+        settings: AppSettings,
+        metadata: dict[str, Any],
+        plan: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Offer AI repair for a movie already in the library, from the estimate the damage review made."""
+        movies = await asyncio.to_thread(self._movie_files, Path(str(job["output_path"])))
+        if not movies:
+            raise RuntimeError("The movie file is no longer in its library folder")
+        movie = movies[0]
+        if not plan or not plan.get("segments") or Path(str(plan.get("source_path") or "")) != movie:
+            # Nothing has priced this movie yet; look through it first and come back with the estimate.
+            return await self.review_damaged_movie(job_id)
+        # The repair reads and replaces its own copy of the movie. A hard link costs no disk space,
+        # and the movie in the library stays untouched until the repaired one is ready.
+        source_root = settings.resolved_directories()["raw"] / f"{job_id}-ai-source-{uuid.uuid4().hex[:8]}.partial"
+        await asyncio.to_thread(source_root.mkdir, parents=True, exist_ok=True)
+        source = source_root / movie.name
+        await asyncio.to_thread(_link_or_copy, movie, source)
+        plan = {
+            **plan,
+            "status": "awaiting_confirmation",
+            "estimate_id": uuid.uuid4().hex,
+            "source_path": str(source),
+            "source_root": str(source_root),
+            "library_path": str(movie),
+            "configured_cost_limit_usd": settings.ai_repair_cost_limit_usd,
+        }
+        metadata["ai_repair"] = plan
+        metadata["recovery_route"] = {
+            "mode": "ai_repair",
+            "status": "awaiting_confirmation",
+            "requested_at": utc_now(),
+        }
+        await asyncio.to_thread(
+            self._append_log,
+            job_id,
+            f"AI repair estimate {plan['estimate_id']} for the finished movie: {plan['frame_count']} frames, "
+            f"up to ${float(plan.get('estimated_max_cost_usd') or 0):.2f}. No API request has been made.",
+        )
+        self.database.update_job(
+            job_id,
+            state=JobState.AWAITING_REPAIR,
+            stage="ai_review",
+            status_detail=_ai_review_detail(plan),
+            progress=0,
+            staging_path=str(source_root),
+            metadata_json=json.dumps(metadata, ensure_ascii=False),
+            recoverable=1,
+            cancel_requested=0,
+            error_code=None,
+            error_message=None,
+        )
+        return self.database.get_job(job_id) or job
+
     async def keep_movie_without_ai(self, job_id: str) -> dict[str, Any]:
         """Finish the movie extracted for the AI analysis as it is, with the damaged moments skipped."""
         job = self.database.get_job(job_id)
@@ -3466,6 +4024,9 @@ class DiscDockService:
         plan = metadata.get("ai_repair") if isinstance(metadata.get("ai_repair"), dict) else None
         if job["state"] != JobState.AWAITING_REPAIR or not plan:
             raise RuntimeError("This job is not waiting for an AI repair decision")
+        if plan.get("library_path"):
+            # The movie is already in the library; declining leaves it exactly as it is.
+            return await self._keep_library_movie_without_ai(job_id, job, metadata, plan)
         source_root = Path(str(plan.get("source_root") or Path(str(plan.get("source_path") or "")).parent))
         if not await asyncio.to_thread(lambda: any(path.is_file() for path in source_root.glob("*.mkv"))):
             raise RuntimeError("The extracted movie is no longer available; choose Retry to extract it again")
@@ -3494,6 +4055,42 @@ class DiscDockService:
             self._resume_damaged_recovery(job_id, drive, keep_salvaged=True), name=f"keep-without-ai-{job_id}"
         )
         self._track_job_task(job_id, drive.id, task)
+        return self.database.get_job(job_id) or job
+
+    async def _keep_library_movie_without_ai(
+        self, job_id: str, job: dict[str, Any], metadata: dict[str, Any], plan: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Decline AI repair for a movie in the library: it stays as it is, and the copy is thrown away."""
+        source_root = Path(str(plan.get("source_root") or ""))
+        if source_root.name.endswith(".partial"):
+            await asyncio.to_thread(shutil.rmtree, source_root, True)
+        # The estimate keeps pointing at the movie in the library, so changing your mind needs no new scan.
+        metadata["ai_repair"] = {
+            **plan,
+            "status": "declined",
+            "declined_at": utc_now(),
+            "source_path": str(plan.get("library_path") or plan.get("source_path") or ""),
+            "source_root": "",
+        }
+        metadata.pop("recovery_route", None)
+        damage = dict(metadata.get("damage") or {}) if isinstance(metadata.get("damage"), dict) else {}
+        # The damaged moments stay listed; only the question is answered.
+        damage.pop("choice", None)
+        if damage:
+            metadata["damage"] = damage
+        self.database.update_job(
+            job_id,
+            state=JobState.COMPLETED,
+            stage="completed",
+            status_detail=str(job.get("status_detail") or "Completed"),
+            progress=100,
+            staging_path=None,
+            metadata_json=json.dumps(metadata, ensure_ascii=False),
+            recoverable=0,
+            error_code=None,
+            error_message=None,
+        )
+        await asyncio.to_thread(self._append_log, job_id, "AI repair declined; the movie stays as it is")
         return self.database.get_job(job_id) or job
 
     async def add_titles_to_completed_disc(self, job_id: str) -> dict[str, Any]:
@@ -3560,6 +4157,140 @@ class DiscDockService:
         await asyncio.to_thread(self._append_log, job_id, "Keeping the movie as it was read, without loading screens")
         return self.database.update_job(job_id, metadata_json=json.dumps(metadata, ensure_ascii=False))
 
+    async def review_damaged_movie(self, job_id: str) -> dict[str, Any]:
+        """Look through a finished movie for broken parts and work out how they can be repaired.
+
+        The quick check after a rescue only sees moments the disc never delivered
+        at all. A part the disc delivered broken looks like ordinary video until
+        it is decoded, so this scan decodes the whole movie. It takes a few
+        minutes, uses no OpenAI credit, and ends with the choice between keeping
+        the movie, loading screens and AI repair.
+        """
+        job = self.database.get_job(job_id)
+        if not job:
+            raise LookupError("Job not found")
+        if job["state"] != JobState.COMPLETED or not job.get("output_path"):
+            raise RuntimeError("Broken parts can be looked for in finished movies in the library")
+        if MediaKind(job["media_kind"]) == MediaKind.MUSIC:
+            raise RuntimeError("Only movies and series can be looked through for broken parts")
+        settings = self._settings_for_job(job)
+        if not settings.ffprobe_path or not Path(settings.ffprobe_path).is_file():
+            raise RuntimeError("FFprobe is required to look for broken parts")
+        movies = await asyncio.to_thread(self._movie_files, Path(str(job["output_path"])))
+        if not movies:
+            raise RuntimeError("The movie file is no longer in its library folder")
+        previous_detail = str(job.get("status_detail") or "Completed")
+        self.database.update_job(
+            job_id,
+            state=JobState.TRANSCODING,
+            stage="damage_scan",
+            status_detail="Looking through the movie for broken parts",
+            progress=0,
+        )
+        task = asyncio.create_task(
+            self._run_damage_review(job_id, settings, movies[0], previous_detail),
+            name=f"damage-review-{job_id}",
+        )
+        self._track_job_task(job_id, str(job.get("drive_id") or ""), task)
+        return self.database.get_job(job_id) or job
+
+    def _ai_repair_possible(self, settings: AppSettings) -> bool:
+        """Whether an AI repair estimate can be worked out. The estimate itself never calls OpenAI."""
+        return bool(
+            settings.ai_repair_enabled
+            and self.secret_store.get("openai_api_key")
+            and settings.ffmpeg_path
+            and Path(settings.ffmpeg_path).is_file()
+        )
+
+    async def _run_damage_review(
+        self, job_id: str, settings: AppSettings, movie: Path, previous_detail: str
+    ) -> None:
+        job = self.database.get_job(job_id) or {}
+        plan: dict[str, Any] | None = None
+        try:
+            if self._ai_repair_possible(settings):
+                # One pass measures the damage and prices replacing it; nothing is sent to OpenAI.
+                plan = await asyncio.to_thread(
+                    analyze_repair,
+                    movie,
+                    settings.ffprobe_path,
+                    model=settings.ai_repair_model,
+                    quality=settings.ai_repair_quality,
+                    keyframes_per_second=settings.ai_repair_keyframes_per_second,
+                    owner=job_id,
+                )
+                moments = _damage_record_from_plan(plan)["moments"]
+            else:
+                measured = await asyncio.to_thread(measure_damage, movie, settings.ffprobe_path, owner=job_id)
+                moments = damage_moments(measured)
+        except asyncio.CancelledError:
+            self.database.update_job(
+                job_id, state=JobState.COMPLETED, stage="completed", progress=100, status_detail=previous_detail
+            )
+            raise
+        except Exception as error:
+            await asyncio.to_thread(
+                self._append_log, job_id, f"Could not look through the movie for broken parts: {error}"
+            )
+            self.database.update_job(
+                job_id, state=JobState.COMPLETED, stage="completed", progress=100, status_detail=previous_detail
+            )
+            await self.notifications.send(
+                job_id, "failed", "The movie could not be looked through", str(error)[:500]
+            )
+            return
+        untreated = [moment for moment in moments if moment.get("treatment") in {"skipped", "brief_glitch", None}]
+        details: dict[str, Any] = {"reviewed_at": utc_now()}
+        if untreated and (
+            (plan or {}).get("segments") or any(loading_screen_worthy(moment) for moment in untreated)
+        ):
+            # There is something to decide: AI can replace frames, a loading screen can cover the hole, or both.
+            details["choice"] = "pending"
+        if plan is not None:
+            plan.update({"status": "estimated", "source_path": str(movie), "source_root": str(movie.parent)})
+            plan["disc_type"] = str(job.get("disc_type") or "")
+            plan["configured_cost_limit_usd"] = settings.ai_repair_cost_limit_usd
+            metadata = dict((self.database.get_job(job_id) or job).get("metadata") or {})
+            metadata["ai_repair"] = plan
+            self.database.update_job(job_id, metadata_json=json.dumps(metadata, ensure_ascii=False))
+        self._record_damage(job_id, moments, [], details)
+        await asyncio.to_thread(
+            self._append_log,
+            job_id,
+            f"Looked through {movie.name} for broken parts: {len(moments)} found"
+            + (
+                f", {plan['frame_count']} frames could be replaced with AI for at most "
+                f"${plan['estimated_max_cost_usd']:.2f}"
+                if plan and plan.get("segments")
+                else ""
+            ),
+        )
+        self.database.update_job(
+            job_id,
+            state=JobState.COMPLETED,
+            stage="completed",
+            progress=100,
+            process_pid=None,
+            status_detail=(
+                f"{previous_detail} · {len(moments)} broken {'moment' if len(moments) == 1 else 'moments'}"
+                if moments
+                else f"{previous_detail} · no broken parts found"
+            ),
+        )
+        await self.notifications.send(
+            job_id,
+            "attention" if moments else "completed",
+            "Broken parts found in the movie" if moments else "No broken parts in the movie",
+            (
+                f"{len(moments)} damaged {'moment' if len(moments) == 1 else 'moments'} in "
+                f"{job.get('title') or 'the movie'}. Choose in DiscDock whether to keep the movie, add loading "
+                "screens or replace the frames with AI."
+                if moments
+                else f"{job.get('title') or 'The movie'} plays through without broken video."
+            ),
+        )
+
     async def add_loading_screens_to_movie(self, job_id: str) -> dict[str, Any]:
         """Put loading screens into a finished movie where its damaged moments still freeze."""
         job = self.database.get_job(job_id)
@@ -3619,6 +4350,11 @@ class DiscDockService:
             raise
         except Exception as error:
             await asyncio.to_thread(self._append_log, job_id, f"Could not add loading screens: {error}")
+        if not screens:
+            # The movie was left exactly as it was, so the choice about it is still open.
+            previous = ((self.database.get_job(job_id) or {}).get("metadata") or {}).get("damage")
+            if isinstance(previous, dict) and previous.get("choice"):
+                details = {**details, "choice": previous["choice"]}
         self._record_damage(job_id, moments, screens, details)
         count = len(screens)
         self.database.update_job(
@@ -4195,6 +4931,14 @@ class DiscDockService:
             }:
                 route_mode = str(previous_recovery["mode"])
 
+        if (
+            route_mode == "ai_repair"
+            and metadata.get("titles_from_rescue")
+            and not self.database.list_tracks(job_id)
+        ):
+            # AI frames need a movie to put them in, and MakeMKV never listed a title for
+            # this disc. Read it again from its file system instead of failing every retry.
+            route_mode = "sector_best_effort"
         # A failed recovery attempt must retry the chosen recovery engine. A
         # generic MakeMKV retry would hit the same unreadable sector and stall
         # again, which is both surprising and wasteful. Those routes check for

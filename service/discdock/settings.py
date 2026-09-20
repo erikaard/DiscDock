@@ -70,6 +70,9 @@ class AppSettings(BaseModel):
     keep_raw_after_transcode: bool = True
     main_feature: bool = True
     extras: bool = True
+    # Every video disc waits on the dashboard for its titles to be picked, from the
+    # ones between the two lengths below, instead of ripping what DiscDock chose.
+    always_choose_titles: bool = False
     min_length_seconds: int = 600
     max_length_seconds: int = 99999
     duplicate_policy: str = "ask"

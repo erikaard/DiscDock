@@ -126,6 +126,139 @@ async def test_vlc_recovery_can_read_a_rescued_iso(monkeypatch, tmp_path: Path) 
     assert expected in runner.args
 
 
+class HangingRunner:
+    """A VLC that writes a little and then loops without writing another byte, until it is stopped."""
+
+    def __init__(self, partial: Path) -> None:
+        self.partial = partial
+        self.stopped = asyncio.Event()
+        self.cancelled = False
+
+    async def run(self, owner: str, args: list[str], **kwargs) -> ProcessResult:
+        del owner, kwargs
+        self.partial.write_bytes(b"x" * (2 * 1024 * 1024))
+        await self.stopped.wait()
+        return ProcessResult(args=args, return_code=1, cancelled=True)
+
+    async def cancel(self, owner: str) -> bool:
+        del owner
+        self.cancelled = True
+        self.stopped.set()
+        return True
+
+
+class SteadyRunner:
+    """A VLC that keeps writing, a step at a time with a pause between, and then finishes."""
+
+    def __init__(self, partial: Path, steps: int, pause: float) -> None:
+        self.partial = partial
+        self.steps = steps
+        self.pause = pause
+        self.cancelled = False
+
+    async def run(self, owner: str, args: list[str], **kwargs) -> ProcessResult:
+        del owner, kwargs
+        with self.partial.open("wb") as handle:
+            for _ in range(self.steps):
+                handle.write(b"x" * (1024 * 1024))
+                handle.flush()
+                await asyncio.sleep(self.pause)
+        return ProcessResult(args=args, return_code=0)
+
+    async def cancel(self, owner: str) -> bool:
+        del owner
+        self.cancelled = True
+        return True
+
+
+def _vlc_tools(tmp_path: Path) -> tuple[str, str]:
+    executable = tmp_path / "vlc.exe"
+    ffprobe = tmp_path / "ffprobe.exe"
+    executable.touch()
+    ffprobe.touch()
+    return str(executable), str(ffprobe)
+
+
+@pytest.mark.asyncio
+async def test_vlc_reading_an_image_is_stopped_when_it_stops_writing(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(media_tools, "IMAGE_STALL_SECONDS", 0.3)
+    monkeypatch.setattr(media_tools, "VLC_POLL_SECONDS", 0.01)
+    image = tmp_path / "rescued-disc.iso"
+    image.touch()
+    destination = tmp_path / "recovery"
+    runner = HangingRunner(destination / "recovered.part.mkv")
+    events: list[dict] = []
+
+    with pytest.raises(ProcessFailure, match="stopped making progress") as failure:
+        await VlcDvdRecovery(*_vlc_tools(tmp_path), runner).recover(
+            "job-6",
+            "D:",
+            destination,
+            title_number=1,
+            chapter_count=12,
+            expected_duration_seconds=3000,
+            estimated_bytes=2_700_000_000,
+            timeout=43200,
+            callback=events.append,
+            source_image=image,
+        )
+
+    assert runner.cancelled
+    assert failure.value.result.cancelled
+    assert any(event["type"] == "log" and "written nothing" in event["message"] for event in events)
+    assert not (destination / "recovered.mkv").exists()
+
+
+@pytest.mark.asyncio
+async def test_vlc_reading_an_image_is_left_alone_while_it_keeps_writing(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(media_tools, "IMAGE_STALL_SECONDS", 0.3)
+    monkeypatch.setattr(media_tools, "VLC_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(media_tools, "_probe_media_duration", lambda path, probe: 2990.0)
+    image = tmp_path / "rescued-disc.iso"
+    image.touch()
+    destination = tmp_path / "recovery"
+    runner = SteadyRunner(destination / "recovered.part.mkv", steps=20, pause=0.01)
+
+    output = await VlcDvdRecovery(*_vlc_tools(tmp_path), runner).recover(
+        "job-7",
+        "D:",
+        destination,
+        title_number=1,
+        chapter_count=12,
+        expected_duration_seconds=3000,
+        estimated_bytes=2_700_000_000,
+        timeout=43200,
+        source_image=image,
+    )
+
+    assert output.exists()
+    assert not runner.cancelled
+
+
+@pytest.mark.asyncio
+async def test_vlc_reading_the_drive_is_never_stopped_for_being_slow(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(media_tools, "IMAGE_STALL_SECONDS", 0.1)
+    monkeypatch.setattr(media_tools, "VLC_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(media_tools, "_probe_media_duration", lambda path, probe: 2990.0)
+    destination = tmp_path / "recovery"
+    # A damaged drive can retry a bad block for a long time; the pause is several times the limit.
+    runner = SteadyRunner(destination / "recovered.part.mkv", steps=2, pause=0.5)
+
+    output = await VlcDvdRecovery(*_vlc_tools(tmp_path), runner).recover(
+        "job-8",
+        "D:",
+        destination,
+        title_number=1,
+        chapter_count=12,
+        expected_duration_seconds=3000,
+        estimated_bytes=2_700_000_000,
+        timeout=43200,
+    )
+
+    assert output.exists()
+    assert not runner.cancelled
+
+
 def _event(**payload) -> str:
     return EVENT_PREFIX + json.dumps(payload)
 

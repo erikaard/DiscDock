@@ -20,6 +20,7 @@ from discdock.damage_screens import (
     splice_encoder_args,
     starts_within_half_a_frame,
     unrepaired_copy_path,
+    window_pieces,
 )
 from discdock.files import rename_video_outputs
 from discdock.models import MediaKind
@@ -230,3 +231,41 @@ def test_the_loading_screen_setting_accepts_only_known_choices() -> None:
     assert AppSettings(damage_placeholder="loading_screen").damage_placeholder == "loading_screen"
     with pytest.raises(ValueError):
         AppSettings(damage_placeholder="gif")
+
+
+def _patch(start: float, end: float, name: str = "screen.mkv") -> dict[str, Any]:
+    return {"start": start, "end": end, "clip": name}
+
+
+def test_a_stretch_of_movie_shorter_than_one_picture_is_covered_by_the_clip() -> None:
+    # The damage at 891.710 s leaves 32 ms of movie after the stretch starts: less than
+    # one picture at 25 fps, which FFmpeg cannot encode into anything.
+    ranges, order, clips = window_pieces([_patch(891.710, 909.550)], 25.0, 891.678, 910.038)
+
+    assert ranges == [(909.550, 910.038)], "no piece of the movie shorter than a picture"
+    assert order == [("clip", 0), ("source", 0)]
+    assert clips == [(Path("screen.mkv"), round((909.550 - 891.678) * 25))], "the clip covers the sliver too"
+
+
+def test_a_stretch_with_room_on_both_sides_keeps_the_movie_around_the_clip() -> None:
+    ranges, order, clips = window_pieces([_patch(846.670, 863.110)], 25.0, 846.278, 863.598)
+
+    assert ranges == [(846.278, 846.670), (863.110, 863.598)]
+    assert order == [("source", 0), ("clip", 0), ("source", 1)]
+    assert clips == [(Path("screen.mkv"), round((863.110 - 846.670) * 25))]
+
+
+def test_a_tail_shorter_than_one_picture_lets_the_clip_run_to_the_end() -> None:
+    ranges, order, clips = window_pieces([_patch(100.0, 119.98)], 25.0, 100.0, 120.0)
+
+    assert ranges == [], "neither side holds a whole picture"
+    assert order == [("clip", 0)]
+    assert clips[0][1] == round(19.98 * 25) + 1, "the clip covers the last sliver as well"
+
+
+def test_a_stretch_that_runs_to_the_end_of_the_movie_keeps_its_open_end() -> None:
+    ranges, order, clips = window_pieces([_patch(10.0, 14.0)], 25.0, 9.0, None)
+
+    assert ranges == [(9.0, 10.0), (14.0, None)]
+    assert order == [("source", 0), ("clip", 0), ("source", 1)]
+    assert len(clips) == 1

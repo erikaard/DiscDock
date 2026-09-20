@@ -488,6 +488,39 @@ def drop_expression(windows: list[SpliceWindow]) -> str:
     return "+".join(parts)
 
 
+def window_pieces(
+    patches: list[dict[str, Any]], fps: float, start: float, end: float | None
+) -> tuple[list[tuple[float, float | None]], list[tuple[str, int]], list[tuple[Path, int]]]:
+    """Split one re-encoded stretch into pieces of the movie and clips, in playing order.
+
+    Damage leaves pictures at uneven distances, so what is left of the movie
+    between the stretch's edge and a clip can be shorter than a single picture.
+    FFmpeg finds nothing to encode in such a sliver and writes an empty file, so
+    the clip next to it covers those milliseconds instead.
+    """
+    ranges: list[tuple[float, float | None]] = []
+    order: list[tuple[str, int]] = []
+    clips: list[tuple[Path, int]] = []
+    cursor = start
+    for patch in sorted(patches, key=lambda item: float(item["start"])):
+        patch_start, patch_end = float(patch["start"]), float(patch["end"])
+        if patch_start - cursor >= 1.0 / fps:
+            ranges.append((cursor, patch_start))
+            order.append(("source", len(ranges) - 1))
+        else:
+            patch_start = cursor
+        clips.append((Path(str(patch["clip"])), max(1, round((patch_end - patch_start) * fps))))
+        order.append(("clip", len(clips) - 1))
+        cursor = max(cursor, patch_end)
+    if end is None or end - cursor >= 1.0 / fps:
+        ranges.append((cursor, end))
+        order.append(("source", len(ranges) - 1))
+    elif clips:
+        clip, frames = clips[-1]
+        clips[-1] = (clip, frames + max(1, round((end - cursor) * fps)))
+    return ranges, order, clips
+
+
 def splice_encoder_args(info: dict[str, Any]) -> list[str]:
     """Encoder settings for pieces that decode as part of the copied movie."""
     codec = str(info.get("codec") or "")
@@ -972,21 +1005,7 @@ class MoviePatcher:
         end = None if window.end_pts is None else window.end_pts * tick
         sar = str(stream.get("sar_text") or "1:1").replace(":", "/")
         normalize = f"format=yuv420p,setsar={sar}"
-        ranges: list[tuple[float, float | None]] = []
-        order: list[tuple[str, int]] = []
-        clips: list[tuple[Path, int]] = []
-        cursor = start
-        for patch in sorted(window.patches, key=lambda item: float(item["start"])):
-            patch_start, patch_end = float(patch["start"]), float(patch["end"])
-            if patch_start - cursor >= 0.5 / fps:
-                ranges.append((cursor, patch_start))
-                order.append(("source", len(ranges) - 1))
-            clips.append((Path(str(patch["clip"])), max(1, round((patch_end - patch_start) * fps))))
-            order.append(("clip", len(clips) - 1))
-            cursor = max(cursor, patch_end)
-        if end is None or end - cursor >= 0.5 / fps:
-            ranges.append((cursor, end))
-            order.append(("source", len(ranges) - 1))
+        ranges, order, clips = window_pieces(window.patches, fps, start, end)
         inputs: list[str] = ["-y", "-copyts"]
         filters: list[str] = []
         clip_offset = 0

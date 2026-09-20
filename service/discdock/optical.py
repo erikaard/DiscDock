@@ -824,6 +824,76 @@ def dvd_vobu_starts(read: ReadSectors, files: dict[str, DiscFile], title_set: in
     )
 
 
+def dvd_title_video_ranges(
+    read: ReadSectors, total_sectors: int, title_number: int, segment_map: str = ""
+) -> list[tuple[int, int]]:
+    """The sectors one DVD title plays, so the movie can be read without the disc's navigation.
+
+    A player follows the navigation in the IFO files to the movie. When damage
+    leaves that navigation in a state MakeMKV refuses, these ranges still point
+    straight at the title's own video. Falls back to the whole title set when the
+    cell table cannot be read, as ``read_dvd_layout`` does.
+    """
+    files = read_video_ts_files(read, total_sectors)
+    title = dvd_title_entry(read, files, title_number)
+    if not title:
+        return []
+    prefix = f"VTS_{title[0]:02d}_"
+    video = merge_ranges(
+        [
+            span
+            for name, entry in files.items()
+            if name.startswith(prefix) and name.endswith(".VOB") and name != f"{prefix}0.VOB"
+            for span in entry.sector_ranges()
+        ]
+    )
+    if not video:
+        return []
+    low, high = video[0][0], video[-1][1]
+    try:
+        cells = dvd_title_cells(read, files, title[0], title[1], title[2], parse_segment_cells(segment_map))
+    except (OSError, ValueError):
+        cells = []
+    if cells and all(low <= start and end <= high for start, end in cells):
+        return cells
+    return video
+
+
+def dvd_video_scrambled(read: ReadSectors, ranges: list[tuple[int, int]], samples: int = 24) -> bool:
+    """Whether the video in these sectors is still CSS-scrambled.
+
+    Scrambled video can only be read by a player that decrypts DVDs, not copied
+    out of a rescued image as it is. Every pack says whether it is scrambled in
+    its PES header, so a handful of packs spread over the movie answer this.
+    """
+    total = sum(max(0, end - start) for start, end in ranges)
+    if total <= 0:
+        return False
+    for index in range(max(1, samples)):
+        offset = total * index // max(1, samples)
+        sector = -1
+        for start, end in ranges:
+            if offset < end - start:
+                sector = start + offset
+                break
+            offset -= end - start
+        if sector < 0:
+            continue
+        try:
+            pack = read(sector, 1)
+        except OpticalError:
+            continue
+        # A pack holds one PES packet; only audio, video and private streams carry the header with the
+        # scrambling bits. Navigation packs (0xBF) and padding (0xBE) never do.
+        if len(pack) < 21 or pack[:4] != b"\x00\x00\x01\xba" or pack[14:17] != b"\x00\x00\x01":
+            continue
+        if pack[17] in {0xBE, 0xBF} or pack[20] & 0xC0 != 0x80:
+            continue
+        if (pack[20] >> 4) & 0x03:
+            return True
+    return False
+
+
 def read_dvd_layout(
     read: ReadSectors,
     total_sectors: int,
@@ -895,22 +965,36 @@ def read_dvd_layout(
     )
 
 
-def dvd_longest_title(read: ReadSectors, files: dict[str, DiscFile]) -> int:
-    """The DVD title with the longest playback time, for a disc MakeMKV could not open."""
+@dataclass
+class DvdTitle:
+    """One title as the disc's own tables describe it, without asking MakeMKV."""
+
+    number: int
+    title_set: int
+    duration_seconds: int
+    chapters: int
+
+
+def dvd_titles(read: ReadSectors, files: dict[str, DiscFile]) -> list[DvdTitle]:
+    """Every title the disc's navigation lists, with the playback time it declares.
+
+    MakeMKV refuses a disc whose navigation damage makes its titles look fake, and
+    then reports none at all. The tables themselves still say what is on the disc.
+    """
     ifo = files.get("VIDEO_TS.IFO")
     if not ifo or not ifo.extents:
-        return 0
+        return []
     ifo_lba = ifo.extents[0][0]
     header = read(ifo_lba, 1)
     if header[:12] != b"DVDVIDEO-VMG" or _be32(header, 0xC4) <= 0:
-        return 0
+        return []
     count = min(99, _be16(read(ifo_lba + _be32(header, 0xC4), 1), 0))
-    best, best_seconds = 0, -1.0
+    titles: list[DvdTitle] = []
     for number in range(1, count + 1):
         entry = dvd_title_entry(read, files, number)
         if not entry:
             continue
-        title_set, vts_title, _ = entry
+        title_set, vts_title, chapters = entry
         vts = files.get(f"VTS_{title_set:02d}_0.IFO")
         if not vts or not vts.extents:
             continue
@@ -927,11 +1011,20 @@ def dvd_longest_title(read: ReadSectors, files: dict[str, DiscFile]) -> int:
         pgc = pgci + _be32(data, pgci + 8 + 8 * (program_chain - 1) + 4)
         if pgc + 8 > len(data):
             continue
-        hours, minutes, seconds = (int(f"{value:02x}") if (value >> 4) < 10 and (value & 15) < 10 else 0 for value in data[pgc + 4 : pgc + 7])
-        total = hours * 3600 + minutes * 60 + seconds
-        if total > best_seconds:
-            best, best_seconds = number, total
-    return best
+        hours, minutes, seconds = (
+            int(f"{value:02x}") if (value >> 4) < 10 and (value & 15) < 10 else 0
+            for value in data[pgc + 4 : pgc + 7]
+        )
+        titles.append(DvdTitle(number, title_set, hours * 3600 + minutes * 60 + seconds, max(1, chapters)))
+    return titles
+
+
+def dvd_longest_title(read: ReadSectors, files: dict[str, DiscFile]) -> int:
+    """The DVD title with the longest playback time, for a disc MakeMKV could not open."""
+    titles = dvd_titles(read, files)
+    if not titles:
+        return 0
+    return max(titles, key=lambda title: (title.duration_seconds, -title.number)).number
 
 
 # --- UDF and Blu-ray layout ----------------------------------------------------------------------

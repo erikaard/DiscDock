@@ -1,5 +1,5 @@
 export type DiscKind = "bluray" | "dvd" | "audio_cd" | "data" | "unknown";
-export type MediaKind = "movie" | "series" | "music" | "data" | "unknown";
+export type MediaKind = "movie" | "series" | "music" | "other" | "data" | "unknown";
 
 export type MetadataCandidate = {
   provider: string;
@@ -89,7 +89,8 @@ export type AiRepairSkipped = {
 
 export type AiRepairPlan = {
   estimate_id: string;
-  status: "awaiting_confirmation" | "applied" | "declined";
+  // "estimated" comes from looking through a finished movie: priced, but not offered for approval yet.
+  status: "estimated" | "awaiting_confirmation" | "applied" | "declined";
   summary?: string;
   notes?: string[];
   can_reread?: boolean;
@@ -165,20 +166,63 @@ export type DamageDetails = {
   // The movie as read from the disc is kept next to the one with loading screens or AI frames.
   keptCopy: boolean;
   loadingScreenMethod: "splice" | "reencode" | "";
-  // The finished movie waits for the choice: keep it as read, or add loading screens.
+  // The finished movie waits for the choice: keep it as read, add loading screens, or replace frames with AI.
   choicePending: boolean;
+  // The whole movie was decoded to find broken parts, not only the moments the disc never delivered.
+  reviewed: boolean;
 };
 
 export function damageDetailsFromJob(job: Job): DamageDetails {
   const damage = job.metadata?.damage;
-  if (!damage || typeof damage !== "object") return { keptCopy: false, loadingScreenMethod: "", choicePending: false };
+  const empty = { keptCopy: false, loadingScreenMethod: "" as const, choicePending: false, reviewed: false };
+  if (!damage || typeof damage !== "object") return empty;
   const record = damage as Record<string, unknown>;
   const method = record.loading_screen_method;
   return {
     keptCopy: record.kept_copy === true,
     loadingScreenMethod: method === "splice" || method === "reencode" ? method : "",
     choicePending: record.choice === "pending",
+    reviewed: typeof record.reviewed_at === "string",
   };
+}
+
+/** Whether a finished movie in the library can be looked through for broken parts. */
+export function offerDamageReview(job: Job): boolean {
+  return (
+    job.state === "completed"
+    && Boolean(job.output_path)
+    && job.media_kind !== "music"
+    && ["dvd", "bluray"].includes(job.disc_type)
+    && !damageDetailsFromJob(job).reviewed
+  );
+}
+
+/** What a data disc holds, listed before it is backed up. */
+export type DiscContents = {
+  kind: "game" | "software" | "media" | "pictures" | "documents" | "files";
+  summary: string;
+  markers?: string[];
+  suggested_title?: string;
+  file_count: number;
+  total_bytes: number;
+  truncated?: boolean;
+  unreadable?: boolean;
+  note?: string;
+  top_level?: { name: string; file_count: number; total_bytes: number }[];
+  entries?: { path: string; size: number }[];
+};
+
+export function discContentsFromJob(job: Job): DiscContents | null {
+  const value = job.metadata?.disc_contents;
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  if (typeof record.file_count !== "number") return null;
+  return record as unknown as DiscContents;
+}
+
+/** Whether this disc is waiting to be named before DiscDock backs it up. */
+export function awaitingDiscBackup(job: Job): boolean {
+  return job.state === "awaiting_input" && (job.disc_type === "data" || job.media_kind === "other");
 }
 
 export type AddToExisting = {
@@ -363,6 +407,7 @@ export type Settings = {
   keep_raw_after_transcode: boolean;
   main_feature: boolean;
   extras: boolean;
+  always_choose_titles: boolean;
   min_length_seconds: number;
   max_length_seconds: number;
   duplicate_policy: string;

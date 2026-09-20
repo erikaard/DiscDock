@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import discdock.workflow as workflow_module
 from discdock import media_tools
 from discdock.media_tools import DataDiscRipper
 from discdock.processes import ProcessFailure, ProcessResult
@@ -129,3 +130,106 @@ async def test_cancelled_data_disc_dry_run_keeps_only_the_partial(monkeypatch, t
 
     assert partial.exists()
     assert not destination.exists()
+
+
+@pytest.mark.asyncio
+async def test_a_game_disc_is_backed_up_and_checked_against_its_own_files(tmp_path: Path, monkeypatch) -> None:
+    """The backup keeps the disc, proves every file is in it, and says how to play it."""
+    from test_disc_rescue import _dvd_reader
+    from test_workflow_recovery import make_job, make_service
+
+    from discdock.disc_files import image_files
+    from discdock.models import DiscKind, DriveInfo, MediaKind
+    from discdock.settings import AppSettings
+
+    settings = AppSettings(data_root=tmp_path)
+    settings.resolved_directories()["logs"].mkdir(parents=True, exist_ok=True)
+    staging = tmp_path / "raw" / "disc.partial"
+    staging.mkdir(parents=True)
+    job = make_job(
+        settings,
+        staging,
+        title="Sims2 Ep1",
+        disc_label="SIMS2_EP1",
+        disc_type=DiscKind.DATA.value,
+        media_kind=MediaKind.OTHER.value,
+    )
+    service, _ = make_service(settings, job)
+    drive = DriveInfo(
+        id="drive-id", letter="D:", name="Drive", media_loaded=True, volume_label="SIMS2_EP1", disc_kind=DiscKind.DATA
+    )
+    read, total = _dvd_reader()
+    disc_image = bytes(read(0, total))
+
+    class FakeRipper:
+        def __init__(self, runner) -> None:
+            pass
+
+        async def rip(self, job_id, letter, destination, callback=None):
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(disc_image)
+            return destination
+
+    monkeypatch.setattr(workflow_module, "DataDiscRipper", FakeRipper)
+    # What Windows showed on the disc before the backup started.
+    (staging / "probe.iso").write_bytes(disc_image)
+    seen = image_files(staging / "probe.iso")
+    (staging / "probe.iso").unlink()
+    job["metadata"] = {
+        "disc_contents": {
+            "kind": "game",
+            "summary": "Looks like a game or program disc: it starts itself from the disc.",
+            "file_count": seen.file_count,
+            "total_bytes": seen.total_bytes,
+            "entries": [{"path": entry.path, "size": entry.size} for entry in seen.entries],
+        }
+    }
+
+    await service._back_up_data_disc("job-id", drive, job, staging)
+
+    image = staging / "Sims2 Ep1.iso"
+    assert image.is_file() and image.stat().st_size == len(disc_image)
+    contents = (staging / "Disc contents.txt").read_text(encoding="utf-8")
+    assert "SIMS2_EP1" in contents and "VIDEO_TS/VIDEO_TS.IFO" in contents
+    how = (staging / "How to use this backup.txt").read_text(encoding="utf-8")
+    assert "Double-click Sims2 Ep1.iso" in how
+    assert "setup or autorun" in how, "a game disc says how to install and play it"
+    assert "does not remove protection" in how, "and is honest about discs that check for the original"
+
+
+@pytest.mark.asyncio
+async def test_a_backup_missing_files_from_the_disc_is_not_accepted(tmp_path: Path, monkeypatch) -> None:
+    from test_workflow_recovery import make_job, make_service
+
+    from discdock.models import DiscKind, DriveInfo, MediaKind
+    from discdock.settings import AppSettings
+
+    settings = AppSettings(data_root=tmp_path)
+    settings.resolved_directories()["logs"].mkdir(parents=True, exist_ok=True)
+    staging = tmp_path / "raw" / "disc.partial"
+    staging.mkdir(parents=True)
+    job = make_job(
+        settings, staging, title="Broken disc", disc_type=DiscKind.DATA.value, media_kind=MediaKind.OTHER.value
+    )
+    job["metadata"] = {
+        "disc_contents": {"kind": "game", "file_count": 1, "total_bytes": 2048,
+                          "entries": [{"path": "setup.exe", "size": 2048}]}
+    }
+    service, _ = make_service(settings, job)
+    drive = DriveInfo(
+        id="drive-id", letter="D:", name="Drive", media_loaded=True, volume_label="BROKEN", disc_kind=DiscKind.DATA
+    )
+
+    class EmptyRipper:
+        def __init__(self, runner) -> None:
+            pass
+
+        async def rip(self, job_id, letter, destination, callback=None):
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(b"\0" * (64 * 2048))
+            return destination
+
+    monkeypatch.setattr(workflow_module, "DataDiscRipper", EmptyRipper)
+
+    with pytest.raises(RuntimeError, match="does not hold everything"):
+        await service._back_up_data_disc("job-id", drive, job, staging)

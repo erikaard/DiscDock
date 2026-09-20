@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,10 +20,16 @@ from .disc_rescue import (
     EXIT_MEDIA_UNAVAILABLE,
     EXIT_WRONG_DISC,
 )
-from .optical import DVD_ECC_BLOCK_SECTORS
+from .optical import DVD_ECC_BLOCK_SECTORS, SECTOR_SIZE
 from .processes import ProcessFailure, ProcessRunner, start_external_process
 
 ProgressCallback = Callable[[dict], Awaitable[None] | None]
+
+# VLC reading a rescued image from disk has no drive to wait for, so when its output stops growing it is
+# looping, for example around a gap in the image. It once read 583 GB from a 3.3 GB image without writing
+# another byte. Reading straight from a damaged drive can stall for a long time and is left alone.
+IMAGE_STALL_SECONDS = 600.0
+VLC_POLL_SECONDS = 2.0
 
 
 def _probe_media_duration(path: Path, ffprobe_path: str) -> float:
@@ -78,6 +85,7 @@ class VlcDvdRecovery:
         callback: ProgressCallback | None = None,
         *,
         source_image: Path | None = None,
+        minimum_share: float = 0.8,
     ) -> Path:
         if not self.executable or not Path(self.executable).is_file():
             raise FileNotFoundError("VLC is required for damaged-DVD recovery")
@@ -118,11 +126,33 @@ class VlcDvdRecovery:
                 no_output_timeout=timeout + 60,
             )
         )
+        stall_limit = IMAGE_STALL_SECONDS if source_image else None
+        last_size = -1
+        last_growth = time.monotonic()
+        stalled = False
         try:
             while not run_task.done():
-                await asyncio.sleep(2)
+                await asyncio.sleep(VLC_POLL_SECONDS)
+                size = partial.stat().st_size if partial.exists() else 0
+                if size != last_size:
+                    last_size, last_growth = size, time.monotonic()
+                elif stall_limit is not None and time.monotonic() - last_growth >= stall_limit and not run_task.done():
+                    stalled = True
+                    if callback:
+                        await _invoke(
+                            callback,
+                            {
+                                "type": "log",
+                                "message": (
+                                    f"VLC has written nothing for {round(stall_limit / 60)} minutes while reading "
+                                    f"the rescued image ({_megabytes(size)} of the movie so far); stopping it"
+                                ),
+                            },
+                        )
+                    await self.runner.cancel(job_id)
+                    break
                 if callback and partial.exists() and estimated_bytes > 0:
-                    percent = min(98.0, partial.stat().st_size * 100 / estimated_bytes)
+                    percent = min(98.0, size * 100 / estimated_bytes)
                     await _invoke(
                         callback,
                         {
@@ -137,15 +167,142 @@ class VlcDvdRecovery:
                 await self.runner.cancel(job_id)
                 await asyncio.gather(run_task, return_exceptions=True)
             raise
+        if stalled:
+            raise ProcessFailure("VLC stopped making progress on the rescued disc image", result)
         if result.return_code != 0 or result.cancelled:
             raise ProcessFailure("VLC damaged-DVD recovery failed", result)
         if not partial.exists() or partial.stat().st_size < 1024 * 1024:
             raise ProcessFailure("VLC did not produce a usable recovery file", result)
         duration = await asyncio.to_thread(_probe_media_duration, partial, self.ffprobe_path)
-        minimum_duration = max(60, expected_duration_seconds * 0.8)
+        minimum_duration = max(60, expected_duration_seconds * minimum_share)
         if expected_duration_seconds > 0 and duration < minimum_duration:
             raise ProcessFailure(
                 "VLC stopped before enough of the movie was recovered; the disc is too damaged for this pass",
+                result,
+            )
+        os.replace(partial, target)
+        return target
+
+
+class FfmpegDvdRecovery:
+    """Copy a DVD title straight out of a rescued image with FFmpeg.
+
+    MakeMKV and VLC both play the disc's navigation, and damage can leave that
+    navigation in a state they refuse or get lost in. The title's own video sits
+    in known sectors of the image, which FFmpeg reads through its ``subfile``
+    protocol without copying them out first. It skips packets it cannot use, so
+    damage becomes a short gap instead of a dead end, and it copies the video and
+    audio untouched at disk speed.
+    """
+
+    def __init__(self, ffmpeg_path: str, ffprobe_path: str, runner: ProcessRunner):
+        self.ffmpeg_path = ffmpeg_path
+        self.ffprobe_path = ffprobe_path
+        self.runner = runner
+
+    @staticmethod
+    def source_url(image: Path, ranges: list[tuple[int, int]]) -> str:
+        """An FFmpeg input that reads the title's sectors of ``image`` in order."""
+        parts = [
+            f"subfile,,start,{start * SECTOR_SIZE},end,{end * SECTOR_SIZE},,:{image}" for start, end in ranges
+        ]
+        return "concat:" + "|".join(parts)
+
+    async def recover(
+        self,
+        job_id: str,
+        image: Path,
+        ranges: list[tuple[int, int]],
+        destination: Path,
+        expected_duration_seconds: int,
+        timeout: int,
+        callback: ProgressCallback | None = None,
+        minimum_share: float = 0.8,
+    ) -> Path:
+        for tool in (self.ffmpeg_path, self.ffprobe_path):
+            if not tool or not Path(tool).is_file():
+                raise FileNotFoundError("FFmpeg is required to copy the movie out of the rescued disc image")
+        if not ranges:
+            raise ValueError("The movie's sectors in the rescued disc image are unknown")
+        destination.mkdir(parents=True, exist_ok=True)
+        target = destination / "recovered.mkv"
+        partial = destination / "recovered.part.mkv"
+        expected_bytes = sum(max(0, end - start) for start, end in ranges) * SECTOR_SIZE
+
+        async def on_line(line: str) -> None:
+            key, _, value = line.partition("=")
+            if key != "total_size" or expected_bytes <= 0 or not callback:
+                return
+            try:
+                written = int(value)
+            except ValueError:
+                return
+            await _invoke(
+                callback,
+                {
+                    "type": "progress",
+                    "percent": max(0.0, min(99.0, written * 100 / expected_bytes)),
+                    "message": "Copying the movie out of the rescued disc image",
+                },
+            )
+
+        args = [
+            self.ffmpeg_path,
+            "-hide_banner",
+            "-nostdin",
+            "-y",
+            "-nostats",
+            "-progress",
+            "pipe:1",
+            "-loglevel",
+            "error",
+            "-fflags",
+            "+discardcorrupt+genpts",
+            "-err_detect",
+            "ignore_err",
+            "-probesize",
+            "50M",
+            "-analyzeduration",
+            "30M",
+            "-i",
+            self.source_url(image, ranges),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-map",
+            "0:s?",
+            "-map_metadata",
+            "-1",
+            "-map_chapters",
+            "-1",
+            "-c",
+            "copy",
+            # A packet cut off by damage can lose its time stamp, and MKV cannot store it.
+            "-bsf",
+            r"noise=drop=eq(pts\,nopts)",
+            # Each part of a DVD title counts time from its own start.
+            "-avoid_negative_ts",
+            "make_zero",
+            "-max_muxing_queue_size",
+            "4096",
+            str(partial),
+        ]
+        result = await self.runner.run(job_id, args, timeout=timeout, no_output_timeout=600, on_line=on_line)
+        if result.cancelled or result.timed_out or result.return_code != 0:
+            errors = [line for line in result.lines if line.strip() and "=" not in line.split(" ", 1)[0]]
+            raise ProcessFailure(
+                f"FFmpeg could not copy the movie out of the rescued disc image. {' '.join(errors[-3:])}".strip(),
+                result,
+            )
+        if not partial.exists() or partial.stat().st_size < 1024 * 1024:
+            raise ProcessFailure("FFmpeg did not copy anything out of the rescued disc image", result)
+        duration = await asyncio.to_thread(_probe_media_duration, partial, self.ffprobe_path)
+        minimum_duration = max(60, expected_duration_seconds * minimum_share)
+        if expected_duration_seconds > 0 and duration < minimum_duration:
+            raise ProcessFailure(
+                f"FFmpeg copied only {duration / 60:.0f} of {expected_duration_seconds / 60:.0f} minutes "
+                "out of the rescued disc image",
                 result,
             )
         os.replace(partial, target)

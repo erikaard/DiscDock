@@ -721,8 +721,8 @@ def _dvd_reader(*, vts_ifo: bytes = b"", vts_title: int = 0, chapters: int = 0):
     return read, total
 
 
-def _vts_ifo(cells: list[tuple[int, int]], vobus: list[int]) -> bytes:
-    """A title set IFO whose one title plays ``cells`` from one program chain."""
+def _vts_ifo(cells: list[tuple[int, int]], vobus: list[int], seconds: int = 0) -> bytes:
+    """A title set IFO whose one title plays ``cells`` from one program chain for ``seconds``."""
     data = bytearray(4 * SECTOR_SIZE)
     data[:12] = b"DVDVIDEO-VTS"
     data[0xC8:0xCC] = (1).to_bytes(4, "big")
@@ -743,6 +743,12 @@ def _vts_ifo(cells: list[tuple[int, int]], vobus: list[int]) -> bytes:
         entry = pgc + 0xEC + 24 * index
         data[entry + 8 : entry + 12] = first.to_bytes(4, "big")
         data[entry + 20 : entry + 24] = last.to_bytes(4, "big")
+    if seconds:
+        # The playback time a DVD declares, in binary-coded decimal hours, minutes and seconds.
+        hours, rest = divmod(seconds, 3600)
+        minutes, remainder = divmod(rest, 60)
+        for offset, value in enumerate((hours, minutes, remainder)):
+            data[pgc + 4 + offset] = int(f"{value:02d}", 16)
     admap = 3 * SECTOR_SIZE
     data[admap : admap + 4] = (4 + 4 * len(vobus) - 1).to_bytes(4, "big")
     for index, start in enumerate(vobus):

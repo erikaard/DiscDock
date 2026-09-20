@@ -1,12 +1,12 @@
 "use client";
 
 import { useState } from "react";
-import { AlertTriangle, Disc3, FileText, Film, FolderOpen, KeyRound, Loader2, RefreshCw, Sparkles } from "lucide-react";
+import { AlertTriangle, Disc3, FileText, Film, FolderOpen, KeyRound, Loader2, RefreshCw, Sparkles, Wrench } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { aiRepairFromJob, api, apiUrl, damageDetailsFromJob, damageMomentsFromJob, type DamageMoment, type DamageTreatment, type Job } from "@/lib/discdock-api";
+import { aiRepairFromJob, api, apiUrl, damageDetailsFromJob, damageMomentsFromJob, offerDamageReview, type DamageMoment, type DamageTreatment, type Job } from "@/lib/discdock-api";
 import type { DiscDockControls } from "@/hooks/use-discdock";
 import { formatBytes, formatDate, StateBadge, titleFor } from "./status";
 
@@ -38,6 +38,18 @@ export function HistoryView({ jobs, busy, controls, libraryOnly = false }: {
   const addLoadingScreens = (job: Job) => {
     const confirmed = window.confirm("Add loading screens to this movie? Where the disc was damaged for 2 seconds or more, the movie then shows a loading screen with the time it continues instead of a frozen picture, and a chapter mark lets you skip it. Only a few seconds around those moments are encoded again; the rest of the video, the audio and the subtitles are copied unchanged. The movie without loading screens is kept next to it.");
     if (confirmed) void controls.addLoadingScreens(job.id);
+  };
+  const aiEstimate = aiRepair && aiRepair.status !== "applied" && aiRepair.segments.length > 0 ? aiRepair : null;
+  // The estimate can come back with nothing to offer: AI only bridges gaps of up to four seconds.
+  const aiTooLong = aiRepair && aiRepair.status !== "applied" && aiRepair.segments.length === 0 && (aiRepair.skipped?.length ?? 0) > 0 ? aiRepair : null;
+  const reviewDamage = (job: Job) => {
+    const confirmed = window.confirm("Look through this movie for broken parts? DiscDock decodes the whole movie to find where the picture breaks up, not only where the disc gave nothing at all. It takes a few minutes, changes nothing and costs nothing. Afterwards you choose what to do with what it finds.");
+    if (confirmed) void controls.reviewDamage(job.id).then((updated) => updated && setSelected(updated));
+  };
+  const repairWithAi = (job: Job) => {
+    const ceiling = aiEstimate ? `$${aiEstimate.estimated_max_cost_usd.toFixed(2)}` : "the estimate";
+    const confirmed = window.confirm(`Replace the broken parts with AI-generated frames? This sends pictures from either side of each damaged moment to OpenAI and costs at most ${ceiling}. You review the estimate before anything is sent. The movie without AI frames is kept next to the repaired one.`);
+    if (confirmed) void controls.prepareAiRepair(job.id).then((updated) => updated && setSelected(updated));
   };
   return (
     <>
@@ -94,6 +106,31 @@ export function HistoryView({ jobs, busy, controls, libraryOnly = false }: {
               </DialogHeader>
               {(metadataPoster || metadataPlot || metadataProvider) && <div className="flex gap-4 rounded-xl border border-white/8 bg-white/[0.02] p-4"><div aria-label={metadataPoster ? `Poster for ${titleFor(selected)}` : undefined} className="hidden h-28 w-20 shrink-0 rounded-lg bg-white/5 bg-cover bg-center sm:block" style={metadataPoster ? { backgroundImage: `url(${JSON.stringify(metadataPoster)})` } : undefined} /><div className="min-w-0"><p className="text-xs font-medium uppercase tracking-[0.14em] text-primary">{metadataProvider || "Disc metadata"}{metadataId ? ` · ${metadataId}` : ""}</p><p className="mt-2 text-sm leading-6 text-muted-foreground">{metadataPlot || "Title and release information matched for this disc."}</p></div></div>}
               {aiRepair?.status === "applied" && <div className="rounded-xl border border-primary/20 bg-primary/6 p-4"><div className="flex items-start gap-3"><Sparkles className="mt-0.5 size-5 shrink-0 text-primary" /><div><p className="text-sm font-semibold">AI repair used</p><p className="mt-1 text-xs leading-5 text-muted-foreground">{aiRepair.frame_count} generated frames from {aiRepair.ai_keyframe_count} OpenAI images · OpenAI cost ${(aiRepair.actual_cost_usd ?? 0).toFixed(4)}.</p></div></div><p className="mt-3 rounded-lg border border-amber-400/15 bg-amber-400/7 px-3 py-2 text-xs leading-5 text-amber-100">These frames were generated, not recovered from the disc. Audio was left unchanged.</p><div className="mt-4 space-y-4">{aiRepair.segments.map((segment) => <div key={segment.index} className="rounded-lg border border-white/8 bg-black/10 p-3"><div className="flex flex-wrap items-center justify-between gap-2 text-xs"><span className="font-medium">Repair {segment.index} · {segment.frame_count} frames</span><span className="font-mono text-muted-foreground">{formatRepairTime(segment.start_seconds)} – {formatRepairTime(segment.end_seconds)}</span></div><video className="mt-3 aspect-video w-full rounded-lg bg-black" controls preload="metadata" src={apiUrl(`/api/v1/jobs/${selected.id}/ai-repair/preview/${segment.index}`)}>Your browser cannot play this AI repair preview.</video></div>)}</div></div>}
+              {selected.stage === "damage_scan" && (
+                <div className="rounded-xl border border-primary/20 bg-primary/6 p-4">
+                  <div className="flex items-start gap-3">
+                    <Loader2 className="mt-0.5 size-5 shrink-0 animate-spin text-primary" />
+                    <div className="min-w-0 flex-1">
+                      <p className="text-sm font-semibold">Looking through the movie for broken parts</p>
+                      <p className="mt-1 text-xs leading-5 text-muted-foreground">Every frame is decoded to find where the picture breaks up. The movie is not changed, and nothing is sent anywhere. The choice of what to do appears here when it is done.</p>
+                    </div>
+                  </div>
+                </div>
+              )}
+              {offerDamageReview(selected) && selected.stage !== "damage_scan" && (
+                <div className="rounded-xl border border-white/8 bg-white/[0.02] p-4">
+                  <div className="flex items-start gap-3">
+                    <Wrench className="mt-0.5 size-5 shrink-0 text-muted-foreground" />
+                    <div className="min-w-0 flex-1">
+                      <p className="text-sm font-semibold">Broken parts</p>
+                      <p className="mt-1 text-xs leading-5 text-muted-foreground">{damage.length > 0 ? "The moments below come from the quick check after the rip, which only sees what the disc never gave at all." : "A movie can play through and still break up where the disc was scratched."} DiscDock can decode the whole movie to find every broken part and then offer loading screens or AI-generated frames for them. It takes a few minutes, changes nothing and costs nothing.</p>
+                    </div>
+                  </div>
+                  <div className="mt-4 flex justify-end">
+                    <Button disabled={busy !== null} variant="outline" size="sm" className="gap-2 border-white/10" onClick={() => reviewDamage(selected)}>{busy === "review-damage" ? <Loader2 className="size-3.5 animate-spin" /> : <Wrench className="size-3.5" />} Replace broken parts</Button>
+                  </div>
+                </div>
+              )}
               {damage.length > 0 && (
                 <div className="rounded-xl border border-amber-400/15 bg-amber-400/[0.05] p-4">
                   <div className="flex items-start gap-3">
@@ -119,14 +156,21 @@ export function HistoryView({ jobs, busy, controls, libraryOnly = false }: {
                       {damageDetails.loadingScreenMethod === "reencode" && " This movie's video format could not be cut at its keyframes, so the whole video was encoded again."}
                     </p>
                   )}
-                  {screensPossible && (
+                  {(screensPossible || aiEstimate) && selected.state === "completed" && (
                     <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
-                      <p className="max-w-md text-xs leading-5 text-muted-foreground">{damageDetails?.choicePending ? "The movie was kept as it was read. Keep it with its frozen moments, or show a loading screen there that says when the movie continues." : "Frozen moments can show a loading screen that says when the movie continues, with a chapter mark to skip it."}</p>
+                      <p className="max-w-md text-xs leading-5 text-muted-foreground">{damageDetails?.choicePending ? "Choose what happens at these moments: keep the movie as it was read, cover them with a loading screen, or let AI draw the missing frames." : "Frozen moments can show a loading screen that says when the movie continues, with a chapter mark to skip it."}</p>
                       <div className="flex flex-wrap gap-2">
                         {damageDetails?.choicePending && <Button disabled={busy !== null} variant="outline" size="sm" className="gap-2 border-white/10" onClick={() => void controls.keepDamagedMovie(selected.id).then((job) => job && setSelected(job))}>{busy === "keep-damaged-movie" && <Loader2 className="size-3.5 animate-spin" />} Keep as it is</Button>}
-                        <Button disabled={busy !== null} variant="outline" size="sm" className="gap-2 border-amber-400/25 text-amber-100" onClick={() => addLoadingScreens(selected)}>{busy === "loading-screens" ? <Loader2 className="size-3.5 animate-spin" /> : <Film className="size-3.5" />} Add loading screens</Button>
+                        {screensPossible && <Button disabled={busy !== null} variant="outline" size="sm" className="gap-2 border-amber-400/25 text-amber-100" onClick={() => addLoadingScreens(selected)}>{busy === "loading-screens" ? <Loader2 className="size-3.5 animate-spin" /> : <Film className="size-3.5" />} Add loading screens</Button>}
+                        {aiEstimate && <Button disabled={busy !== null} size="sm" className="gap-2 bg-primary text-primary-foreground" title={`${aiEstimate.frame_count} frames from ${aiEstimate.ai_keyframe_count} OpenAI images`} onClick={() => repairWithAi(selected)}>{busy === "prepare-ai-repair" ? <Loader2 className="size-3.5 animate-spin" /> : <Sparkles className="size-3.5" />} Replace with AI · up to ${aiEstimate.estimated_max_cost_usd.toFixed(2)}</Button>}
                       </div>
                     </div>
+                  )}
+                  {aiTooLong && (
+                    <p className="mt-3 flex items-start gap-2 text-xs leading-5 text-muted-foreground">
+                      <Sparkles className="mt-0.5 size-3.5 shrink-0" />
+                      <span>{aiTooLong.summary || "The damage is too long for AI-generated frames."} AI can only draw over a gap of up to four seconds.</span>
+                    </p>
                   )}
                 </div>
               )}

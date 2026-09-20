@@ -48,6 +48,26 @@ def test_a_finished_movie_interrupted_while_getting_loading_screens_stays_finish
     assert database.get_job("rip")["state"] == "interrupted", "a rip that was never finished is still interrupted"
 
 
+def test_a_finished_movie_interrupted_while_looked_through_stays_finished(tmp_path) -> None:
+    database = Database(tmp_path / "discdock.db")
+    database.initialize()
+    database.upsert_drive({"id": "drive", "letter": "D:", "name": "Reader", "last_seen": "now"})
+    database.create_job(job("movie", "transcoding"))
+    database.update_job(
+        "movie",
+        stage="damage_scan",
+        status_detail="Looking through the movie for broken parts",
+        output_path=str(tmp_path / "Movie (2009)"),
+        completed_at="2026-09-12T21:04:33+00:00",
+    )
+
+    database.initialize()
+
+    movie = database.get_job("movie")
+    assert movie["state"] == "completed", "looking through a movie changes nothing, so it is still finished"
+    assert movie["status_detail"] == "Completed"
+
+
 def test_job_events_are_compact(tmp_path) -> None:
     database = Database(tmp_path / "discdock.db")
     database.initialize()

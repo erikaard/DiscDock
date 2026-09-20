@@ -66,6 +66,9 @@ def make_service(settings: AppSettings, job: dict[str, Any]) -> tuple[DiscDockSe
     service.drive_control = SimpleNamespace()
     service.runner = object()
     service.drives = {}
+    service._tasks = {}
+    service._pending_insertions = {}
+    service._shutting_down = False
     service._interruptions = {}
     service._last_progress_write = {}
     service._last_progress_log = {}
@@ -769,7 +772,7 @@ async def test_a_saved_image_with_unread_blocks_is_read_again_only_with_the_disc
         calls.append("rescue")
         return {"rescued_bytes": 1, "unreadable_bytes": 0, "pending_bytes": 0}
 
-    async def extract(job_id, letter, active_settings, active_image, destination, main_track) -> None:
+    async def extract(job_id, letter, active_settings, active_image, destination, main_track, **kwargs) -> None:
         calls.append("extract")
 
     service._run_sector_rescue = rescue  # type: ignore[method-assign]
@@ -1071,7 +1074,7 @@ async def test_a_rescue_stopped_by_a_drive_fault_can_finish_without_the_drive(tm
     async def must_not_read(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
         pytest.fail("a stuck drive must not be read when finishing with what was rescued")
 
-    async def extract(job_id, letter, active_settings, active_image, destination, main_track) -> None:
+    async def extract(job_id, letter, active_settings, active_image, destination, main_track, **kwargs) -> None:
         extracted.append(active_image)
 
     service._run_sector_rescue = must_not_read  # type: ignore[method-assign]
@@ -1394,7 +1397,7 @@ async def test_an_image_with_only_the_movie_read_gets_the_rest_of_the_disc_when_
     attempts: list[int] = []
     rescues: list[dict[str, Any]] = []
 
-    async def fake_extract(job_id, letter, active_settings, image_path, staging_path, main_track):
+    async def fake_extract(job_id, letter, active_settings, image_path, staging_path, main_track, **kwargs):
         attempts.append(1)
         if len(attempts) == 1:
             raise RuntimeError("MakeMKV could not find the selected movie in the rescued disc image")
@@ -1586,3 +1589,272 @@ def test_unread_extras_outside_the_movie_are_not_retry_work(tmp_path: Path) -> N
     rescue_map.meta["relevant_pending_sectors"] = 16
     rescue_map.save(map_path)
     assert DiscDockService._rescue_has_retry_work(image, settings) is True
+
+
+@pytest.mark.asyncio
+async def test_a_dvd_makemkv_refuses_is_copied_out_of_the_image_with_ffmpeg(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from test_disc_rescue import _dvd_reader, _vts_ifo
+
+    settings = AppSettings(data_root=tmp_path, ffmpeg_path=str(tmp_path / "ffmpeg.exe"), vlc_path=str(tmp_path / "vlc.exe"))
+    (tmp_path / "ffmpeg.exe").touch()
+    (tmp_path / "vlc.exe").touch()
+    staging = tmp_path / "raw" / "attempt.partial"
+    staging.mkdir(parents=True)
+    read, total = _dvd_reader(vts_ifo=_vts_ifo([(0, 49), (120, 199)], [0, 50, 120]), vts_title=1, chapters=2)
+    image = tmp_path / "raw" / "disc.rescue" / "rescued-disc.iso"
+    image.parent.mkdir(parents=True)
+    image.write_bytes(read(0, total))
+    service, _ = make_service(settings, make_job(settings, staging))
+    copies: list[Any] = []
+
+    class FakeFfmpeg:
+        def __init__(self, ffmpeg_path, ffprobe_path, runner):
+            pass
+
+        async def recover(self, job_id, source, ranges, destination, duration, timeout, callback=None, **kwargs):
+            copies.append((source, ranges, duration))
+            destination.mkdir(parents=True, exist_ok=True)
+            (destination / "title_t00.mkv").write_bytes(b"copied movie")
+            return destination / "title_t00.mkv"
+
+    class RefusedVlc:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("VLC is the last resort, not the first fallback")
+
+    monkeypatch.setattr(workflow_module, "FfmpegDvdRecovery", FakeFfmpeg)
+    monkeypatch.setattr(workflow_module, "VlcDvdRecovery", RefusedVlc)
+
+    class FakeMakeMKV:
+        async def inspect_source(self, job_id, source, min_length, timeout, callback=None):
+            # The damaged navigation makes MakeMKV call the movie a fake title.
+            return DiscScan(titles=[TitleInfo(id=0, duration_seconds=180, chapters=1)])
+
+        async def rip_source(self, *args, **kwargs):
+            raise AssertionError("MakeMKV found no movie to extract")
+
+    service._make_mkv = lambda active_settings=None: FakeMakeMKV()  # type: ignore[method-assign]
+
+    await service._extract_title_from_image(
+        "job-id", "D:", settings, image, staging, {"source_id": 1, "disc_title_number": 2, "duration_seconds": 3000}
+    )
+
+    assert copies == [(image, [(700, 750), (820, 900)], 3000)], "only the sectors the title plays"
+    assert (staging / "title_t00.mkv").read_bytes() == b"copied movie"
+    assert not (staging / ".rescued-title.partial").exists()
+
+
+@pytest.mark.asyncio
+async def test_a_scrambled_image_goes_to_vlc_because_its_sectors_cannot_be_copied(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = AppSettings(data_root=tmp_path, ffmpeg_path=str(tmp_path / "ffmpeg.exe"), vlc_path=str(tmp_path / "vlc.exe"))
+    (tmp_path / "ffmpeg.exe").touch()
+    (tmp_path / "vlc.exe").touch()
+    staging = tmp_path / "raw" / "attempt.partial"
+    staging.mkdir(parents=True)
+    image = tmp_path / "rescued-disc.iso"
+    image.write_bytes(b"iso")
+    service, _ = make_service(settings, make_job(settings, staging))
+    monkeypatch.setattr(
+        DiscDockService, "_dvd_movie_sectors", staticmethod(lambda path, title, segments: ([(700, 900)], True))
+    )
+
+    class RefusedFfmpeg:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("scrambled sectors must not be copied as they are")
+
+    played: list[Any] = []
+
+    class FakeVlc:
+        def __init__(self, executable, ffprobe_path, runner):
+            pass
+
+        async def recover(self, job_id, letter, destination, title, chapters, duration, size, timeout, **kwargs):
+            played.append((title, kwargs.get("source_image")))
+            destination.mkdir(parents=True, exist_ok=True)
+            (destination / "recovered.mkv").write_bytes(b"played movie")
+            return destination / "recovered.mkv"
+
+    monkeypatch.setattr(workflow_module, "FfmpegDvdRecovery", RefusedFfmpeg)
+    monkeypatch.setattr(workflow_module, "VlcDvdRecovery", FakeVlc)
+
+    class FakeMakeMKV:
+        async def inspect_source(self, *args, **kwargs):
+            raise ProcessFailure("MakeMKV could not open the image", ProcessResult(args=[], return_code=1))
+
+    service._make_mkv = lambda active_settings=None: FakeMakeMKV()  # type: ignore[method-assign]
+
+    await service._extract_title_from_image(
+        "job-id", "D:", settings, image, staging, {"source_id": 1, "disc_title_number": 2, "duration_seconds": 3000}
+    )
+
+    assert played == [(2, image)]
+    assert (staging / "recovered.mkv").read_bytes() == b"played movie"
+
+
+@pytest.mark.asyncio
+async def test_the_repair_methods_run_in_order_without_waiting_for_the_user(tmp_path: Path) -> None:
+    settings = AppSettings(data_root=tmp_path, rescue_extra_minutes=30)
+    staging = tmp_path / "raw" / "attempt.partial"
+    staging.mkdir(parents=True)
+    from discdock.disc_rescue import FINISHED, NON_TRIED, RescueMap
+
+    service, _ = make_service(settings, make_job(settings, staging))
+    # A rescue that read the movie but never touched the extras and menus.
+    image = service._rescue_image("job-id", settings)
+    image.parent.mkdir(parents=True, exist_ok=True)
+    image.write_bytes(b"iso")
+    RescueMap(64, [(0, 48, FINISHED), (48, 64, NON_TRIED)], {"relevant_pending_sectors": 0}).save(
+        DvdSectorRescue.artifact_paths(image)["map"]
+    )
+    drive = DriveInfo(
+        id="drive-id",
+        letter="D:",
+        name="Drive",
+        media_loaded=True,
+        volume_label="DAMAGED_DISC",
+        disc_kind=DiscKind.DVD,
+    )
+    service.drives = {drive.id: drive}
+    steps: list[Any] = []
+
+    async def rescue(job_id, active_drive, active_settings, active_image, main_track, **kwargs) -> dict[str, Any]:
+        steps.append(f"read the rest: whole_disc={kwargs.get('whole_disc')}")
+        return {"rescued_bytes": 1}
+
+    async def extract(job_id, letter, active_settings, active_image, destination, main_track, **kwargs) -> None:
+        methods = kwargs["methods"]
+        steps.append(methods)
+        if methods != ("vlc",):
+            raise RuntimeError(f"nothing in {methods} could read it")
+        kwargs["problems"].append("done")
+
+    service._run_sector_rescue = rescue  # type: ignore[method-assign]
+    service._extract_title_from_image = extract  # type: ignore[method-assign]
+
+    await service._recover_disc_to_staging("job-id", drive, settings, staging, {"source_id": 0})
+
+    assert steps == [
+        ("makemkv", "ffmpeg"),
+        "read the rest: whole_disc=True",
+        ("makemkv", "ffmpeg"),
+        ("vlc",),
+    ], "the image first, then the rest of the disc, and VLC only when nothing else is left"
+
+
+@pytest.mark.asyncio
+async def test_a_disc_that_never_listed_a_title_is_rescued_instead_of_failing_on_retry(tmp_path: Path) -> None:
+    settings = AppSettings(data_root=tmp_path)
+    staging = tmp_path / "raw" / "attempt.partial"
+    staging.mkdir(parents=True)
+    job = make_job(
+        settings,
+        staging,
+        state=JobState.FAILED,
+        stage="failed",
+        error_code="ai_repair_preparation_failed",
+        error_message="This job has no selected movie title to recover",
+        metadata={
+            "titles_from_rescue": True,
+            "recovery_route": {"mode": "ai_repair", "status": "failed"},
+            "warnings": [{"code": "disc_read_error", "message": "The drive is retrying an unreadable part."}],
+        },
+    )
+    service, database = make_service(settings, job)
+    database.tracks = []
+    drive = DriveInfo(
+        id="drive-id", letter="D:", name="Drive", media_loaded=True, volume_label="DAMAGED_DISC", disc_kind=DiscKind.DVD
+    )
+    service.drives = {drive.id: drive}
+    service._pending_insertions = {}
+    service._external_drive_blockers = lambda letter="": []  # type: ignore[method-assign]
+    started: list[str] = []
+
+    async def process(job_id: str, manual: bool = False) -> None:
+        started.append(job_id)
+
+    service._process_job = process  # type: ignore[method-assign]
+
+    await service.retry_job("job-id")
+    await service._tasks["job-id"]
+
+    assert started == ["job-id"], "the disc is read again from its file system"
+    assert job["state"] == JobState.QUEUED and job["stage"] == "recovering"
+    assert job["metadata"]["titles_from_rescue"] is True
+    assert job["error_code"] is None, "the AI dead end is cleared"
+
+
+@pytest.mark.asyncio
+async def test_an_image_finished_early_is_read_further_before_giving_up(tmp_path: Path) -> None:
+    from discdock.disc_rescue import FINISHED, NON_TRIED, RescueMap
+
+    settings = AppSettings(data_root=tmp_path, rescue_extra_minutes=30)
+    staging = tmp_path / "raw" / "attempt.partial"
+    staging.mkdir(parents=True)
+    service, _ = make_service(settings, make_job(settings, staging))
+    # A rescue that swept the whole disc once but still has most of the movie to retry.
+    image = service._rescue_image("job-id", settings)
+    image.parent.mkdir(parents=True, exist_ok=True)
+    image.write_bytes(b"iso")
+    RescueMap(64, [(0, 16, FINISHED), (16, 64, NON_TRIED)], {"sweep_done": True, "relevant_pending_sectors": 48}).save(
+        DvdSectorRescue.artifact_paths(image)["map"]
+    )
+    drive = DriveInfo(
+        id="drive-id", letter="D:", name="Drive", media_loaded=True, volume_label="DAMAGED_DISC", disc_kind=DiscKind.DVD
+    )
+    service.drives = {drive.id: drive}
+    steps: list[Any] = []
+
+    async def rescue(job_id, active_drive, active_settings, active_image, main_track, **kwargs) -> dict[str, Any]:
+        steps.append("read the skipped spots")
+        return {"rescued_bytes": 1}
+
+    async def extract(job_id, letter, active_settings, active_image, destination, main_track, **kwargs) -> None:
+        steps.append(kwargs["methods"])
+        if steps.count("read the skipped spots") < 2:
+            raise RuntimeError("only part of the movie is in the image")
+
+    service._run_sector_rescue = rescue  # type: ignore[method-assign]
+    service._extract_title_from_image = extract  # type: ignore[method-assign]
+
+    await service._recover_disc_to_staging("job-id", drive, settings, staging, {"source_id": 0})
+
+    assert steps == [
+        "read the skipped spots",
+        ("makemkv", "ffmpeg"),
+        "read the skipped spots",
+        ("makemkv", "ffmpeg"),
+    ], "the skipped spots are read again before VLC is asked to guess"
+
+
+@pytest.mark.asyncio
+async def test_finishing_now_keeps_the_movie_however_little_came_back(tmp_path: Path) -> None:
+    settings = AppSettings(data_root=tmp_path, rescue_extra_minutes=30)
+    staging = tmp_path / "raw" / "attempt.partial"
+    staging.mkdir(parents=True)
+    job = make_job(settings, staging, metadata={"recovery": {"finish_without_reading": True}})
+    service, _ = make_service(settings, job)
+    image = service._rescue_image("job-id", settings)
+    image.parent.mkdir(parents=True, exist_ok=True)
+    image.write_bytes(b"iso")
+    drive = DriveInfo(
+        id="drive-id", letter="D:", name="Drive", media_loaded=True, volume_label="DAMAGED_DISC", disc_kind=DiscKind.DVD
+    )
+    service.drives = {drive.id: drive}
+    shares: list[float] = []
+
+    async def rescue(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        pytest.fail("the disc must not be read again after choosing to finish now")
+
+    async def extract(job_id, letter, active_settings, active_image, destination, main_track, **kwargs) -> None:
+        shares.append(kwargs["minimum_share"])
+
+    service._run_sector_rescue = rescue  # type: ignore[method-assign]
+    service._extract_title_from_image = extract  # type: ignore[method-assign]
+
+    await service._recover_disc_to_staging("job-id", drive, settings, staging, {"source_id": 0})
+
+    assert shares == [0.1], "half a movie is still better than none when it was asked for"
+    assert job["metadata"]["recovery"]["finish_without_reading"] is False, "the choice is used once"

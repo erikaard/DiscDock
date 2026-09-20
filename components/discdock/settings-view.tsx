@@ -35,6 +35,7 @@ type Draft = {
   keep_raw_after_transcode: boolean;
   main_feature: boolean;
   extras: boolean;
+  always_choose_titles: boolean;
   min_length_seconds: number;
   max_length_seconds: number;
   duplicate_policy: string;
@@ -62,6 +63,7 @@ const pickDraft = (settings: Settings): Draft => ({
   keep_raw_after_transcode: settings.keep_raw_after_transcode,
   main_feature: settings.main_feature,
   extras: settings.extras,
+  always_choose_titles: settings.always_choose_titles ?? false,
   min_length_seconds: settings.min_length_seconds,
   max_length_seconds: settings.max_length_seconds,
   duplicate_policy: settings.duplicate_policy,
@@ -158,6 +160,7 @@ export function SettingsView({ settings, health, busy, controls }: {
         <Section icon={Wrench} eyebrow="Disc selection" title="Titles and extras" description="These defaults can still be overridden for a manual job.">
           <ToggleRow label="Select main feature" detail="Rip exactly one likely feature, using OMDb runtime when available and filtering duplicate angles." checked={draft.main_feature} onChange={(value) => setDraft((current) => ({ ...current, main_feature: value, ...(value ? { extras: false } : {}) }))} />
           <ToggleRow label="Include extras and episodes" detail="Keep every title that passes the duration filter instead of choosing one feature." checked={draft.extras && !draft.main_feature} onChange={(value) => setDraft((current) => ({ ...current, extras: value, ...(value ? { main_feature: false } : {}) }))} />
+          <ToggleRow label="Always choose titles" detail="Every disc waits on the dashboard, as Choose titles does, listing the titles between the two lengths below with the ones above already ticked." checked={draft.always_choose_titles} onChange={(value) => update("always_choose_titles", value)} />
           <div className="grid gap-4 pt-2 sm:grid-cols-2">
             <Field label="Minimum title length (minutes)">
               <Input type="number" min={0} max={1440} value={Math.round(draft.min_length_seconds / 60)} onChange={(event) => update("min_length_seconds", Math.max(0, Number(event.target.value) * 60))} className="border-white/10 bg-white/[0.025]" />

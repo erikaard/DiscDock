@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "discdock"
-version = "1.9.5"
+version = "1.10.0"
 description = "Windows-native automatic media ripping service"
 requires-python = ">=3.12"
 dependencies = [

@@ -18,6 +18,9 @@ class MediaKind(StrEnum):
     MOVIE = "movie"
     SERIES = "series"
     MUSIC = "music"
+    # Anything that is not a film or an album: a game, a program, or files to keep.
+    OTHER = "other"
+    # Discs backed up before DiscDock 1.10 were filed as data and stay there.
     DATA = "data"
     UNKNOWN = "unknown"
 

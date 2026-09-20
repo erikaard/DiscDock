@@ -171,13 +171,15 @@ class Database:
 
     @staticmethod
     def recover_interrupted(connection: sqlite3.Connection) -> None:
-        # A finished movie that was getting loading screens is still finished: its
-        # library file is only replaced once the new copy has been verified.
+        # A finished movie that was being looked through for broken parts, or getting
+        # loading screens, is still finished: its library file is only replaced once
+        # the new copy has been verified, and looking through it changes nothing.
         connection.execute(
             "UPDATE jobs SET state='completed', stage='completed', progress=100, process_pid=NULL, "
-            "status_detail=CASE WHEN status_detail LIKE 'Adding loading screens%' THEN 'Completed' "
+            "status_detail=CASE WHEN status_detail LIKE 'Adding loading screens%' "
+            "OR status_detail LIKE 'Looking through the movie%' THEN 'Completed' "
             "ELSE status_detail END, updated_at=?, version=version+1 "
-            "WHERE state IN ('transcoding', 'cancelling') AND stage='damage_screens' "
+            "WHERE state IN ('transcoding', 'cancelling') AND stage IN ('damage_screens', 'damage_scan') "
             "AND completed_at IS NOT NULL AND COALESCE(output_path, '') <> ''",
             (utc_now(),),
         )
