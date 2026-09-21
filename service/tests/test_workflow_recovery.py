@@ -9,7 +9,7 @@ import pytest
 
 import discdock.workflow as workflow_module
 from discdock.disc_rescue import FINISHED, RescueMap
-from discdock.makemkv import DiscScan
+from discdock.makemkv import DiscScan, NoVideoTitles
 from discdock.media_tools import DvdSectorRescue
 from discdock.models import DiscKind, DriveInfo, JobState, MediaKind, TitleInfo
 from discdock.processes import ProcessFailure, ProcessResult
@@ -1858,3 +1858,38 @@ async def test_finishing_now_keeps_the_movie_however_little_came_back(tmp_path: 
 
     assert shares == [0.1], "half a movie is still better than none when it was asked for"
     assert job["metadata"]["recovery"]["finish_without_reading"] is False, "the choice is used once"
+
+
+@pytest.mark.asyncio
+async def test_a_bluray_image_with_no_titles_at_all_goes_through_the_backup_folder(tmp_path: Path) -> None:
+    """MakeMKV skips a damaged M2TS and reports nothing; the disc's own decryption information still works."""
+    settings = AppSettings(data_root=tmp_path)
+    staging = tmp_path / "raw" / "attempt.partial"
+    staging.mkdir(parents=True)
+    image = tmp_path / "raw" / "disc.rescue" / "rescued-disc.iso"
+    image.parent.mkdir(parents=True)
+    image.write_bytes(b"iso")
+    service, _ = make_service(settings, make_job(settings, staging, disc_type=DiscKind.BLURAY.value))
+    through_backup: list[str] = []
+
+    async def backup_folder(job_id, letter, active_settings, active_image, extracted, main_track, min_length,
+                            spot, stuck, scan_event, extraction_event) -> None:
+        through_backup.append(spot)
+        extracted.mkdir(parents=True, exist_ok=True)
+        (extracted / "title_t00.mkv").write_bytes(b"movie")
+
+    service._extract_through_backup_folder = backup_folder  # type: ignore[method-assign]
+
+    class NoTitlesMakeMKV:
+        async def inspect_source(self, job_id, source, min_length, timeout, callback=None):
+            # "Failed to decode audio/video data for title #0 ... title skipped" leaves nothing behind.
+            raise NoVideoTitles("MakeMKV found no video titles", ProcessResult(args=[], return_code=0), 0)
+
+    service._make_mkv = lambda active_settings=None: NoTitlesMakeMKV()  # type: ignore[method-assign]
+
+    await service._extract_title_from_image(
+        "job-id", "D:", settings, image, staging, {"source_id": 0, "duration_seconds": 5400}
+    )
+
+    assert through_backup and "no video titles" in through_backup[0]
+    assert (staging / "title_t00.mkv").read_bytes() == b"movie"

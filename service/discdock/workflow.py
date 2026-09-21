@@ -2256,9 +2256,11 @@ class DiscDockService:
         except MakeMKVLicenseError:
             raise
         except (ProcessFailure, RuntimeError) as error:
-            if stuck and not is_dvd:
-                # MakeMKV cannot decrypt this Blu-ray from a plain image. With the
-                # discatt.dat its own backup saves from the drive, it can.
+            if not is_dvd and not attributes_saved:
+                # A Blu-ray image MakeMKV cannot use has one more way out, whether it kept
+                # failing at a corrupt spot or skipped the movie and reported no title at
+                # all: its own discatt.dat from the drive, and the disc's files rebuilt
+                # from the image with the unread sectors as empty packets.
                 repeats.clear()
                 if extracted.exists():
                     await asyncio.to_thread(shutil.rmtree, extracted)
@@ -2270,7 +2272,7 @@ class DiscDockService:
                     extracted,
                     main_track,
                     min_length,
-                    stuck[0],
+                    stuck[0] if stuck else f"the movie in the rescued image ({error})",
                     stuck,
                     scan_event,
                     extraction_event,
