@@ -186,3 +186,22 @@ async def test_rip_source_accepts_a_rescued_iso(tmp_path: Path) -> None:
     assert f"iso:{image}" in runner.args
     assert "--noscan" in runner.args, "an image rip must not wait for MakeMKV to probe a damaged disc in the drive"
     assert "0" in runner.args
+
+
+def test_the_disc_name_is_the_one_makemkv_reads_from_the_disc() -> None:
+    parser = MakeMKVParser("D:")
+    for line in (
+        'DRV:0,2,999,1,"BD-RE TSSTcorp BDDVDW SE-506CB TS02","DVD_VIDEO","D:"',
+        'CINFO:1,6206,"DVD disc"',
+        'CINFO:2,0,"Ghostbusters 2 - Special Edition"',
+        'CINFO:32,0,"DVD_VIDEO"',
+        "TCOUNT:1",
+        'TINFO:0,9,0,"1:43:40"',
+    ):
+        parser.accept(line)
+
+    assert parser.finish().disc_name == "Ghostbusters 2 - Special Edition", "not the volume label"
+
+    labelled = MakeMKVParser("D:")
+    labelled.accept('DRV:0,2,999,1,"Drive","FROZEN","D:"')
+    assert labelled.finish().disc_name == "FROZEN", "the label still serves when the disc names nothing"

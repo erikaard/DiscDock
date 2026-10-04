@@ -214,3 +214,32 @@ async def test_a_damaged_disc_is_not_read_again_for_its_layout(tmp_path: Path, m
     await service._title_contents("job-id", drive, scan)
 
     assert reads == [Path("D:/VIDEO_TS")], "read once for the healthy disc, not for the damaged one"
+
+
+def test_a_disc_omdb_does_not_know_is_recognised_as_episodes_by_its_titles() -> None:
+    # Barnas Favoritter 2: five cartoons, one of them twice as long as the others.
+    titles = [_title(0, 10.0, 4), _title(1, 20.2, 7), _title(2, 10.1, 8), _title(3, 12.3, 9), _title(4, 10.4, 10)]
+
+    chosen = select_disc_titles(titles, _settings(main_feature=True))
+
+    assert [title.id for title in chosen] == [0, 1, 2, 3, 4], "every cartoon, the long one too"
+
+
+def test_a_film_disc_is_not_mistaken_for_episodes() -> None:
+    # Mickey's Twice Upon a Christmas: a 64-minute film and short extras, with no minimum length.
+    titles = [_title(0, 64.5, 1), _title(1, 7.1, 11), _title(2, 3.2, 12), _title(3, 3.0, 68), _title(4, 11.8, 72)]
+    # And a film with three featurettes of similar length to each other.
+    featurettes = [_title(0, 92, 1), _title(1, 14, 2), _title(2, 16, 3), _title(3, 15, 4)]
+
+    assert [title.id for title in select_disc_titles(titles, _settings(main_feature=True, minimum=0))] == [0]
+    assert [title.id for title in select_disc_titles(featurettes, _settings(main_feature=True))] == [0]
+
+
+def test_omdb_naming_a_film_that_fits_the_disc_settles_it() -> None:
+    # Three 63-minute titles look like episodes, but OMDb knows a 63-minute film by this name.
+    titles = [_title(0, 63.0, 1), _title(1, 63.3, 2), _title(2, 63.3, 3)]
+
+    film = select_disc_titles(titles, _settings(main_feature=True), 66, media_kind=MediaKind.MOVIE)
+    unknown = select_disc_titles(titles, _settings(main_feature=True))
+
+    assert len(film) == 1 and len(unknown) == 3

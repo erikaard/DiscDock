@@ -57,7 +57,14 @@ from .files import (
     verify_outputs,
 )
 from .instance import SingleInstance
-from .makemkv import DiscScan, MakeMKVClient, MakeMKVLicenseError, NoVideoTitles, match_title
+from .makemkv import (
+    DiscScan,
+    MakeMKVClient,
+    MakeMKVLicenseError,
+    NoVideoTitles,
+    match_title,
+    navigation_skipped,
+)
 from .media_tools import (
     AudioRipper,
     DataDiscRipper,
@@ -67,6 +74,7 @@ from .media_tools import (
     FfmpegDvdRecovery,
     HandBrakeTranscoder,
     VlcDvdRecovery,
+    _probe_media_duration,
     describe_rescue_progress,
 )
 from .metadata import MetadataService, label_is_code, label_is_generic, runtime_fits, title_from_label
@@ -196,8 +204,8 @@ def _composite_parts(title: Any, titles: list[Any], contents: dict[int, TitleCon
     """How many other titles a "play all" title strings together; 0 when it is a video of its own.
 
     With the disc's layout this is exact. Without it, ``guess`` lets lengths speak: on a
-    series disc a title as long as a whole number of its equally long episodes is them
-    in a row (Lego Chima's 84½ minutes are four 21-minute episodes).
+    series disc a title as long as three or more of its equally long episodes is them in
+    a row (Lego Chima's 84½ minutes are four 21-minute episodes).
     """
     content = contents.get(title.id)
     if content is not None:
@@ -225,7 +233,9 @@ def _composite_parts(title: Any, titles: list[Any], contents: dict[int, TitleCon
     typical = sum(episodes) / len(episodes)
     count = round(title.duration_seconds / typical)
     exact = abs(title.duration_seconds - count * typical) <= 0.03 * title.duration_seconds
-    return count if 2 <= count <= len(episodes) and exact else 0
+    # Twice as long as the rest is too easily a programme of its own (Barnas Favoritter 2's
+    # 20-minute cartoon among 10-minute ones); three or more in a row are a "play all".
+    return count if 3 <= count <= len(episodes) and exact else 0
 
 
 def _episode_titles(titles: list[Any], contents: dict[int, TitleContent]) -> list[Any]:
@@ -315,6 +325,19 @@ def manual_release(album: dict[str, Any]) -> AlbumRelease:
     )
 
 
+# The longest a title can be and still be an episode, rather than a film.
+EPISODE_MAX_SECONDS = 70 * 60
+
+
+def _looks_like_episodes(titles: list[Any]) -> bool:
+    """Whether a disc holds a series: three or more programmes of a similar, short length.
+
+    A film disc does not look like this: its film is far longer than any of its extras.
+    """
+    lengths = sorted(title.duration_seconds for title in titles if title.duration_seconds > 0)
+    return len(lengths) >= 3 and lengths[-1] <= EPISODE_MAX_SECONDS and lengths[-1] <= 3 * lengths[0]
+
+
 def select_disc_titles(
     titles: list[Any],
     settings: AppSettings,
@@ -329,6 +352,8 @@ def select_disc_titles(
     once per credits language, an extra angle, a second title playing the same sectors)
     one is kept. A series keeps every episode, without the "play all" that strings them
     together, even with "Select main feature": its main feature is all of its episodes.
+    OMDb says whether a disc is a series; when it does not know the disc, three or more
+    titles of a similar length under 70 minutes make one.
     Otherwise "Select main feature" picks the film: the title closest to its published
     running time, or the longest one.
     """
@@ -341,11 +366,20 @@ def select_disc_titles(
         return eligible
     contents = contents or {}
     distinct = _distinct_titles(eligible, contents)
-    series = media_kind == MediaKind.SERIES
-    episodes = _episode_titles(distinct, contents) if series else []
+    episodes = _episode_titles(distinct, contents)
+    lengths = [title.duration_seconds / 60 for title in distinct]
+    if media_kind == MediaKind.SERIES:
+        series = True
+    elif media_kind == MediaKind.MOVIE and runtime_minutes > 0 and runtime_fits(runtime_minutes, lengths):
+        series = False
+    else:
+        # OMDb does not know the disc, or names a film it does not hold: the disc tells. Every
+        # title counts, a "play all" too: a film-length title means a film disc, where titles
+        # that make it up are its scenes, and the film is what to keep.
+        series = _looks_like_episodes(distinct)
     if not settings.main_feature:
         return episodes if series else distinct
-    if len(episodes) >= 2:
+    if series and len(episodes) >= 2:
         return episodes
 
     # Multi-angle discs often expose the same program several times. Keep one
@@ -424,6 +458,49 @@ def _drive_stopped_responding(lines: list[str]) -> bool:
     return any(marker in line.casefold() for line in lines for marker in DRIVE_GONE_MARKERS)
 
 
+# "IFO file for VTS #1 is corrupt, VOB file must be scanned": MakeMKV then rebuilds the disc's
+# navigation from its video and prints nothing until it lists the titles, often for minutes.
+NAVIGATION_REBUILD_START = "MSG:3042,"
+NAVIGATION_REBUILD_END = ("MSG:3015,", "MSG:3025,", "MSG:3028,", "TCOUNT:")
+# A new MakeMKV run ends any rebuild the last one was in.
+MAKEMKV_STARTED = "MSG:1005,"
+DEFAULT_REBUILD_SECONDS = 360.0
+REBUILD_TICK_SECONDS = 3.0
+
+
+def _clock(seconds: float) -> str:
+    minutes, rest = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}:{minutes:02d}:{rest:02d}" if hours else f"{minutes}:{rest:02d}"
+
+
+# A film MakeMKV leaves out "due to navigation error" is looked for this many more times.
+FEATURE_RESCANS = 2
+
+
+def _skipped_feature(lines: list[str], titles: list[Any], settings: AppSettings) -> int:
+    """The length of a title MakeMKV skipped for a navigation error that looks like the film, or 0.
+
+    It must be long enough to pass the length filter and clearly longer than anything
+    MakeMKV did list: Ghostbusters II's 1:44:04 against cartoon episodes of 26 minutes.
+    """
+    skipped = [
+        seconds
+        for seconds in navigation_skipped(lines)
+        if settings.min_length_seconds <= seconds <= settings.max_length_seconds
+    ]
+    if not skipped:
+        return 0
+    longest_listed = max((title.duration_seconds for title in titles), default=0)
+    film = max(skipped)
+    return film if film > longest_listed * 1.5 else 0
+
+
+def _format_duration(seconds: int) -> str:
+    hours, rest = divmod(int(seconds), 3600)
+    return f"{hours}:{rest // 60:02d}:{rest % 60:02d}"
+
+
 def _has_disc_read_warning(job: dict[str, Any]) -> bool:
     warnings = (job.get("metadata") or {}).get("warnings") or []
     return any(
@@ -434,6 +511,10 @@ def _has_disc_read_warning(job: dict[str, Any]) -> bool:
 
 class DiscTooDamagedToOpen(RuntimeError):
     """MakeMKV could not open the disc because of read errors; the user decides whether to rescue it."""
+
+
+class WrongTitleRipped(RuntimeError):
+    """MakeMKV ripped a title of another length than the one chosen from its scan."""
 
 
 class ImageNotDecryptable(RuntimeError):
@@ -1089,6 +1170,7 @@ class DiscDockService:
         event_type = str(event.get("type") or "")
         message = str(event.get("message") or "")
         now = time.monotonic()
+        self._follow_navigation_rebuild(job_id, message, now)
         # MakeMKV can emit dozens of progress records per second. Keep periodic
         # samples instead of opening the log file for every single tick.
         should_log_progress = now - self._last_progress_log.get(job_id, 0) >= 5.0
@@ -1201,6 +1283,47 @@ class DiscDockService:
                 job_id, progress=max(0, min(100, float(event.get("percent", 0))))
             )
 
+    def _follow_navigation_rebuild(self, job_id: str, message: str, now: float) -> None:
+        """Notice MakeMKV starting and finishing its silent rebuild of a disc's navigation."""
+        rebuilds: dict[str, float] = self.__dict__.setdefault("_rebuilds", {})
+        if message.startswith(NAVIGATION_REBUILD_START) and job_id not in rebuilds:
+            rebuilds[job_id] = now
+            self._spawn(self._show_navigation_rebuild(job_id, now), f"navigation-rebuild-{job_id}")
+        elif job_id in rebuilds and message.startswith(NAVIGATION_REBUILD_END):
+            took = now - rebuilds.pop(job_id)
+            job = self.database.get_job(job_id)
+            if job:
+                metadata = dict(job.get("metadata") or {})
+                metadata["navigation_rebuild_seconds"] = round(took)
+                self.database.update_job(job_id, metadata_json=json.dumps(metadata, ensure_ascii=False))
+        elif job_id in rebuilds and message.startswith(MAKEMKV_STARTED):
+            rebuilds.pop(job_id)
+
+    async def _show_navigation_rebuild(self, job_id: str, started: float) -> None:
+        """Show MakeMKV's silent rebuild of a disc's navigation as a step with its own progress.
+
+        MakeMKV prints nothing while it rebuilds, so the time it took on this job's last
+        MakeMKV run (a rip repeats the scan's rebuild) stands in for a percentage.
+        """
+        rebuilds: dict[str, float] = self.__dict__.setdefault("_rebuilds", {})
+        job = self.database.get_job(job_id) or {}
+        expected = float((job.get("metadata") or {}).get("navigation_rebuild_seconds") or 0)
+        while rebuilds.get(job_id) == started:
+            job = self.database.get_job(job_id) or {}
+            elapsed = time.monotonic() - started
+            if job.get("state") not in {JobState.INSPECTING, JobState.RIPPING} or elapsed > 3 * 3600:
+                break
+            step = "Rebuilding the disc's damaged navigation (copy protection)"
+            if expected and elapsed <= expected:
+                detail, share = f"{step} · {_clock(elapsed)} of about {_clock(expected)}", elapsed / expected
+            elif expected:
+                detail, share = f"{step} · {_clock(elapsed)}, longer than the {_clock(expected)} it took before", 0.99
+            else:
+                detail = f"{step} · {_clock(elapsed)} so far, usually a few minutes"
+                share = min(0.95, elapsed / DEFAULT_REBUILD_SECONDS)
+            self.database.update_job(job_id, status_detail=detail, progress=round(min(share, 0.99) * 100, 1))
+            await asyncio.sleep(REBUILD_TICK_SECONDS)
+
     @staticmethod
     def _disc_fingerprint(drive: DriveInfo, scan: DiscScan | None, job_id: str = "") -> str:
         material: dict[str, Any] = {"kind": drive.disc_kind.value, "label": drive.volume_label.casefold()}
@@ -1251,40 +1374,112 @@ class DiscDockService:
                 # Decrypting a Blu-ray can keep MakeMKV silent for minutes on a slow drive, and
                 # so can a copy-protected DVD while it sorts out dozens of decoy titles.
                 make_mkv.no_output_timeout = max(make_mkv.no_output_timeout, 600)
-            try:
-                return await make_mkv.inspect(
-                    job_id,
-                    drive.letter,
-                    settings.min_length_seconds,
-                    settings.max_length_seconds,
-                    settings.inspect_timeout_seconds,
-                    lambda event: self._process_event(job_id, event),
-                )
-            except MakeMKVLicenseError:
-                raise
-            except ProcessFailure as error:
-                latest = self.database.get_job(job_id) or job
-                if (
-                    isinstance(error, NoVideoTitles)
-                    and error.too_short
-                    and settings.min_length_seconds > 0
-                    and not _has_disc_read_warning(latest)
-                ):
-                    return await self._inspect_short_titles(job_id, drive, settings, make_mkv, error.too_short)
-                if drive.disc_kind not in {DiscKind.DVD, DiscKind.BLURAY} or not _has_disc_read_warning(latest):
+            for attempt in range(FEATURE_RESCANS + 1):
+                try:
+                    scan = await make_mkv.inspect(
+                        job_id,
+                        drive.letter,
+                        settings.min_length_seconds,
+                        settings.max_length_seconds,
+                        settings.inspect_timeout_seconds,
+                        lambda event: self._process_event(job_id, event),
+                    )
+                except MakeMKVLicenseError:
                     raise
-                if settings.damaged_disc_action != "best_effort":
-                    raise DiscTooDamagedToOpen(
-                        "MakeMKV cannot open this disc because parts of it are unreadable. Choose Recover: DiscDock "
-                        "reads the disc's file system first, lets MakeMKV find the movie in that copy, and then "
-                        "reads the movie while skipping what cannot be read."
-                    ) from error
-                await asyncio.to_thread(
-                    self._append_log,
-                    job_id,
-                    f"MakeMKV could not open the damaged disc ({error}); reading its file system first, as set in Settings",
-                )
+                except ProcessFailure as error:
+                    skipped = _skipped_feature(error.result.lines, [], settings)
+                    if skipped and attempt < FEATURE_RESCANS and not _drive_stopped_responding(error.result.lines):
+                        await self._scan_again_for_feature(job_id, skipped, attempt)
+                        continue
+                    latest = self.database.get_job(job_id) or job
+                    if (
+                        isinstance(error, NoVideoTitles)
+                        and error.too_short
+                        and settings.min_length_seconds > 0
+                        and not _has_disc_read_warning(latest)
+                    ):
+                        scan = await self._inspect_short_titles(job_id, drive, settings, make_mkv, error.too_short)
+                        self._record_skipped_feature(job_id, skipped)
+                        return scan
+                    if drive.disc_kind not in {DiscKind.DVD, DiscKind.BLURAY} or not _has_disc_read_warning(latest):
+                        raise
+                    if settings.damaged_disc_action != "best_effort":
+                        raise DiscTooDamagedToOpen(
+                            "MakeMKV cannot open this disc because parts of it are unreadable. Choose Recover: "
+                            "DiscDock reads the disc's file system first, lets MakeMKV find the movie in that copy, "
+                            "and then reads the movie while skipping what cannot be read."
+                        ) from error
+                    await asyncio.to_thread(
+                        self._append_log,
+                        job_id,
+                        f"MakeMKV could not open the damaged disc ({error}); reading its file system first, "
+                        "as set in Settings",
+                    )
+                    break
+                skipped = _skipped_feature(scan.raw_lines, scan.titles, settings)
+                if skipped and attempt < FEATURE_RESCANS:
+                    await self._scan_again_for_feature(job_id, skipped, attempt)
+                    continue
+                self._record_skipped_feature(job_id, skipped)
+                return scan
         return await self._scan_rescued_structures(job_id, drive, settings)
+
+    async def _check_ripped_title(
+        self, job_id: str, staging: Path, tracks: list[dict[str, Any]], settings: AppSettings
+    ) -> None:
+        """Make sure MakeMKV ripped the title that was chosen, not another one under its number.
+
+        MakeMKV numbers titles by its own analysis of the disc, and repeats that analysis when it
+        rips. On a disc whose navigation it rebuilds every time, the film chosen from the scan can
+        be gone from the rip's list, and its number then belongs to an extra. The rip is thrown
+        away rather than filed under the film's name.
+        """
+        chosen = [int(track.get("duration_seconds") or 0) for track in tracks if track.get("selected")]
+        expected = max(chosen, default=0)
+        files = [path for path in staging.rglob("*.mkv") if path.is_file()]
+        if expected <= 0 or not files or not settings.ffprobe_path:
+            return
+        durations = [await asyncio.to_thread(_probe_media_duration, path, settings.ffprobe_path) for path in files]
+        longest = max(durations)
+        if longest <= 0 or abs(longest - expected) <= max(60, expected * 0.05):
+            return
+        for path in files:
+            path.unlink(missing_ok=True)
+        await asyncio.to_thread(
+            self._append_log,
+            job_id,
+            f"MakeMKV ripped a {_format_duration(int(longest))} title, not the {_format_duration(expected)} one "
+            "chosen from its scan; the rip was removed",
+        )
+        raise WrongTitleRipped(
+            f"MakeMKV ripped a {_format_duration(int(longest))} title instead of the {_format_duration(expected)} "
+            "one that was chosen: its second look at the disc listed the titles differently. Retry to scan the "
+            "disc again."
+        )
+
+    async def _scan_again_for_feature(self, job_id: str, skipped: int, attempt: int) -> None:
+        await asyncio.to_thread(
+            self._append_log,
+            job_id,
+            f"MakeMKV left out a {_format_duration(skipped)} title \"due to navigation error\", though it is longer "
+            f"than every title it listed: most likely the film. Scanning the disc again ({attempt + 2} of "
+            f"{FEATURE_RESCANS + 1})",
+        )
+        self.database.update_job(
+            job_id, status_detail=f"MakeMKV left out the {_format_duration(skipped)} film; scanning the disc again"
+        )
+
+    def _record_skipped_feature(self, job_id: str, skipped: int) -> None:
+        """Remember a film MakeMKV would not list, so nothing shorter is ripped in its place."""
+        job = self.database.get_job(job_id) or {}
+        metadata = dict(job.get("metadata") or {})
+        if skipped:
+            metadata["feature_skipped_seconds"] = skipped
+        elif "feature_skipped_seconds" in metadata:
+            metadata.pop("feature_skipped_seconds")
+        else:
+            return
+        self.database.update_job(job_id, metadata_json=json.dumps(metadata, ensure_ascii=False))
 
     async def _inspect_short_titles(
         self, job_id: str, drive: DriveInfo, settings: AppSettings, make_mkv: Any, too_short: int
@@ -1863,9 +2058,27 @@ class DiscDockService:
                 # between the minimum and maximum length ready to tick, as the Choose titles
                 # button does for one disc.
                 always_choosing = settings.always_choose_titles
-                if (manual or needs_identification or short_titles_only or always_choosing) and is_video:
+                # MakeMKV would not list the film, even when asked again: whatever it did list is
+                # shorter and not the film (Ghostbusters II's cartoon episodes), so nothing is
+                # ripped without a choice, and nothing is ticked in advance.
+                feature_skipped = int(metadata.get("feature_skipped_seconds") or 0)
+                if feature_skipped and scan:
+                    tracks = [{**title.model_dump(), "selected": False} for title in scan.titles]
+                    self.database.replace_tracks(job_id, tracks)
+                    await asyncio.to_thread(
+                        self._append_log,
+                        job_id,
+                        f"MakeMKV still leaves out the {_format_duration(feature_skipped)} film after "
+                        f"{FEATURE_RESCANS + 1} scans; waiting for a choice instead of ripping a shorter title",
+                    )
+                if (
+                    manual or needs_identification or short_titles_only or always_choosing or feature_skipped
+                ) and is_video:
                     status_detail = (
-                        "Every title is shorter than the minimum length in Settings — choose what to rip"
+                        f"MakeMKV left out the {_format_duration(feature_skipped)} film because of a navigation "
+                        "error — Retry to scan the disc again, or choose titles"
+                        if feature_skipped
+                        else "Every title is shorter than the minimum length in Settings — choose what to rip"
                         if short_titles_only
                         else "No OMDb match found — search or enter the title"
                         if needs_identification
@@ -1904,6 +2117,8 @@ class DiscDockService:
                 await self._fail(job_id, "tool_missing", str(error), blocked=True)
             except MakeMKVLicenseError as error:
                 await self._fail(job_id, "makemkv_license", str(error), blocked=True)
+            except WrongTitleRipped as error:
+                await self._fail(job_id, "wrong_title_ripped", str(error), detail="MakeMKV ripped another title")
             except DiscTooDamagedToOpen as error:
                 await self._fail(job_id, "disc_unreadable", str(error), detail="Too damaged for MakeMKV to open")
             except ProcessFailure as error:
@@ -3207,6 +3422,8 @@ class DiscDockService:
                 raise ProcessFailure("Switching to AI repair preparation", results[-1])
             if (latest.get("metadata") or {}).get("recovery_requested"):
                 raise ProcessFailure("Switching to damaged-disc recovery", results[-1])
+            if settings.rip_mode != "backup":
+                await self._check_ripped_title(job_id, staging, tracks, settings)
 
         self.database.update_job(
             job_id,
@@ -5323,6 +5540,41 @@ class DiscDockService:
             or job
         )
 
+    async def _confirm_disc(
+        self, job_id: str, drive: DriveInfo, settings: AppSettings, fingerprint: str
+    ) -> None:
+        """Make sure the disc in the drive is the one whose titles were chosen.
+
+        The titles must come out as they did before, since MakeMKV rips by its own
+        numbering. A disc whose navigation MakeMKV rebuilds on every scan can list them
+        differently from one scan to the next, leaving the film out "due to navigation
+        error", so a scan that skipped a title is repeated before anything is concluded.
+        """
+        make_mkv = self._make_mkv(settings)
+        skipped_before = 0
+        for attempt in range(FEATURE_RESCANS + 1):
+            scan = await make_mkv.inspect(
+                job_id,
+                drive.letter,
+                settings.min_length_seconds,
+                settings.max_length_seconds,
+                settings.inspect_timeout_seconds,
+                lambda event: self._process_event(job_id, event),
+            )
+            if self._disc_fingerprint(drive, scan, job_id) == fingerprint:
+                return
+            skipped_before = max(navigation_skipped(scan.raw_lines), default=0)
+            if not skipped_before or attempt == FEATURE_RESCANS:
+                break
+            await self._scan_again_for_feature(job_id, skipped_before, attempt)
+        if skipped_before:
+            raise RuntimeError(
+                f"MakeMKV listed this disc's titles differently this time: it left out a "
+                f"{_format_duration(skipped_before)} title because of a navigation error, so the title chosen "
+                "earlier cannot be found. Retry to scan the disc again."
+            )
+        raise RuntimeError("This is not the same disc that was inspected. Reinsert the original disc.")
+
     async def _resume_job(self, job_id: str, drive: DriveInfo) -> None:
         async with self._drive_locks[drive.id]:
             try:
@@ -5340,18 +5592,7 @@ class DiscDockService:
                         stage="confirming_disc",
                         status_detail="Confirming the original disc",
                     )
-                    scan = await self._make_mkv(settings).inspect(
-                        job_id,
-                        drive.letter,
-                        settings.min_length_seconds,
-                        settings.max_length_seconds,
-                        settings.inspect_timeout_seconds,
-                        lambda event: self._process_event(job_id, event),
-                    )
-                    if self._disc_fingerprint(drive, scan, job_id) != job["fingerprint"]:
-                        raise RuntimeError(
-                            "This is not the same disc that was inspected. Reinsert the original disc."
-                        )
+                    await self._confirm_disc(job_id, drive, settings, str(job["fingerprint"] or ""))
                 latest = self.database.get_job(job_id) or job
                 await self._rip_and_finish(
                     job_id,

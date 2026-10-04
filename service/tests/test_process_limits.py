@@ -85,3 +85,26 @@ async def test_a_licence_question_is_not_waited_on_for_long(tmp_path: Path) -> N
         await MakeMKVClient(str(executable), runner, no_output_timeout=600).inspect("job", "D:", 600, 99999, 900)
 
     assert runner.limits is not None and runner.limits.no_output_timeout == LICENSE_PROMPT_SILENCE_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_ripping_such_a_dvd_gets_the_same_time_as_scanning_it(tmp_path: Path) -> None:
+    # Ghostbusters II: the scan was given its seven silent minutes, then the rip, which
+    # repeats MakeMKV's analysis of the disc, was stopped three minutes into it.
+    executable = tmp_path / "makemkvcon64.exe"
+    executable.write_bytes(b"stub")
+    destination = tmp_path / "rip"
+
+    class RipRunner(_Runner):
+        async def run(self, _owner: str, args: list[str], **kwargs) -> ProcessResult:
+            result = await super().run(_owner, args, **kwargs)
+            (destination / "title_t00.mkv").write_bytes(b"x" * (2 * 1024 * 1024))
+            return result
+
+    runner = RipRunner(['MSG:3042,0,1,"IFO file for VTS #1 is corrupt, VOB file must be scanned."'])
+
+    await MakeMKVClient(str(executable), runner, no_output_timeout=180).rip("job", "D:", destination, [0], 43200)
+
+    assert runner.limits is not None
+    assert runner.limits.no_output_timeout == SLOW_SCAN_SILENCE_SECONDS
+    assert runner.limits.timeout == 43200, "a long rip keeps its own, longer limit"

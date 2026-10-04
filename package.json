@@ -1,6 +1,6 @@
 {
   "name": "discdock-windows",
-  "version": "1.10.5",
+  "version": "1.10.8",
   "private": true,
   "engines": {
     "node": ">=22.13.0"

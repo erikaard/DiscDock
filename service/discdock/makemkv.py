@@ -55,6 +55,17 @@ def has_license_prompt(messages: list[dict]) -> bool:
     return any(message.get("code") in MAKEMKV_LICENSE_MESSAGE_CODES for message in messages)
 
 
+# "Title #1 (1:44:04) was skipped due to navigation error". On a disc whose copy protection
+# corrupts its IFO files on purpose, MakeMKV rebuilds the navigation from the video every
+# time, and one run can accept the film that the next one leaves out.
+NAVIGATION_SKIPPED = re.compile(r'^MSG:3015,.*?\((\d+:\d{2}:\d{2})\)')
+
+
+def navigation_skipped(lines: list[str]) -> list[int]:
+    """How long each title was, in seconds, that MakeMKV left out because of a navigation error."""
+    return [parse_duration(found.group(1)) for line in lines if (found := NAVIGATION_SKIPPED.match(line))]
+
+
 def license_action(messages: list[dict]) -> str:
     """What to do about MakeMKV's licence, in the words that match what it said."""
     if any(message.get("code") in MAKEMKV_EXPIRED_MESSAGE_CODES for message in messages):
@@ -136,6 +147,9 @@ class MakeMKVParser:
         self.letter = letter.rstrip(":").upper() + ":"
         self.scan = DiscScan()
         self._titles: dict[int, dict] = {}
+        # The name MakeMKV reads from the disc itself (CINFO 2): "Ghostbusters 2 - Special
+        # Edition" on a disc whose volume label is DVD_VIDEO. The drive list only has the label.
+        self._disc_title = ""
 
     def accept(self, line: str) -> dict | None:
         self.scan.raw_lines.append(line)
@@ -150,6 +164,8 @@ class MakeMKVParser:
                 self.scan.drive_name = fields[4]
                 self.scan.disc_name = fields[5]
                 self.scan.device_name = fields[6]
+        elif record == "CINFO" and len(fields) >= 3 and fields[0] == "2" and fields[2].strip():
+            self._disc_title = fields[2].strip()
         elif record in {"TCOUNT", "TCOUT"} and fields:
             self.scan.title_count = int(fields[0])
         elif record == "MSG" and len(fields) >= 4:
@@ -244,6 +260,8 @@ class MakeMKVParser:
         self.scan.titles = titles
         if not self.scan.title_count:
             self.scan.title_count = len(titles)
+        if self._disc_title:
+            self.scan.disc_name = self._disc_title
         return self.scan
 
 
@@ -255,6 +273,27 @@ class MakeMKVClient:
         self.executable = str(Path(executable))
         self.runner = runner
         self.no_output_timeout = no_output_timeout
+
+    def _watched(
+        self, timeout: float, on_line: Callable[[str], Awaitable[None]]
+    ) -> tuple[ProcessLimits, Callable[[str], Awaitable[None]]]:
+        """Time limits for one MakeMKV run, and a line handler that fits them to what MakeMKV says.
+
+        Every run that opens a disc repeats MakeMKV's analysis of it, so a ripping run
+        on a disc with a deliberately corrupt IFO is as silent for as long as the scan was.
+        """
+        limits = ProcessLimits(timeout, self.no_output_timeout)
+
+        async def watch(line: str) -> None:
+            if line.startswith(MAKEMKV_SLOW_SCAN_MESSAGE):
+                limits.no_output_timeout = max(limits.no_output_timeout, SLOW_SCAN_SILENCE_SECONDS)
+                limits.timeout = max(limits.timeout, SLOW_SCAN_TIMEOUT_SECONDS)
+            elif LICENSE_LINE.match(line):
+                # A licence question waits for an answer that never comes; stop soon after it.
+                limits.no_output_timeout = min(limits.no_output_timeout, LICENSE_PROMPT_SILENCE_SECONDS)
+            await on_line(line)
+
+        return limits, watch
 
     def _base_args(self, source: str = "") -> list[str]:
         args = [self.executable, "-r", "--cache=1", "--messages=-stdout", "--progress=-stdout"]
@@ -304,12 +343,14 @@ class MakeMKVClient:
                 await self.runner.cancel(owner_id)
             state["size"] = size
 
+        limits, watch = self._watched(timeout, on_line)
         result = await self.runner.run(
             owner_id,
             [*self._base_args(), "backup", f"disc:{int(drive_index)}", str(folder)],
             timeout=timeout,
             no_output_timeout=self.no_output_timeout,
-            on_line=on_line,
+            on_line=watch,
+            limits=limits,
         )
         if has_license_prompt(parser.scan.messages):
             raise MakeMKVLicenseError(license_action(parser.scan.messages), result)
@@ -351,17 +392,7 @@ class MakeMKVClient:
                     await response
 
         args = self._base_args(source) + [f"--minlength={min_length}", "info", source]
-        limits = ProcessLimits(timeout, self.no_output_timeout)
-
-        async def watch(line: str) -> None:
-            if line.startswith(MAKEMKV_SLOW_SCAN_MESSAGE):
-                limits.no_output_timeout = max(limits.no_output_timeout, SLOW_SCAN_SILENCE_SECONDS)
-                limits.timeout = max(limits.timeout, SLOW_SCAN_TIMEOUT_SECONDS)
-            elif LICENSE_LINE.match(line):
-                # A licence question waits for an answer that never comes; stop soon after it.
-                limits.no_output_timeout = min(limits.no_output_timeout, LICENSE_PROMPT_SILENCE_SECONDS)
-            await on_line(line)
-
+        limits, watch = self._watched(timeout, on_line)
         result = await self.runner.run(
             owner_id, args, timeout=timeout, no_output_timeout=self.no_output_timeout, on_line=watch, limits=limits
         )
@@ -446,8 +477,9 @@ class MakeMKVClient:
                     if hasattr(response, "__await__"):
                         await response
 
+            limits, watch = self._watched(timeout, on_line)
             result = await self.runner.run(
-                owner_id, args, timeout=timeout, no_output_timeout=self.no_output_timeout, on_line=on_line
+                owner_id, args, timeout=timeout, no_output_timeout=self.no_output_timeout, on_line=watch, limits=limits
             )
             results.append(result)
             if has_license_prompt(parser.scan.messages):
