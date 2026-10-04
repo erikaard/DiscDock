@@ -300,6 +300,19 @@ class ProcessResult:
 LineCallback = Callable[[str], Awaitable[None] | None]
 
 
+@dataclass
+class ProcessLimits:
+    """How long a tool may run, and stay silent, in seconds.
+
+    A tool that says it is about to take long (MakeMKV: "IFO file is corrupt, VOB
+    file must be scanned. This may take very long time") can be given more while it
+    runs; ``ProcessRunner.run`` reads both again after every line.
+    """
+
+    timeout: float
+    no_output_timeout: float
+
+
 class ProcessFailure(RuntimeError):
     def __init__(self, message: str, result: ProcessResult):
         super().__init__(message)
@@ -393,8 +406,10 @@ class ProcessRunner:
         on_line: LineCallback | None = None,
         keep_awake: bool = True,
         env: dict[str, str] | None = None,
+        limits: ProcessLimits | None = None,
     ) -> ProcessResult:
-        """Run a tool; ``env`` adds variables to its environment."""
+        """Run a tool; ``env`` adds variables to its environment, ``limits`` replaces both time limits."""
+        limits = limits or ProcessLimits(timeout, no_output_timeout)
         if not args or not Path(args[0]).is_file():
             raise FileNotFoundError(args[0] if args else "executable")
         started = time.monotonic()
@@ -453,11 +468,13 @@ class ProcessRunner:
             last_output = time.monotonic()
             while True:
                 now = time.monotonic()
-                if now - started > timeout:
+                if now - started > limits.timeout:
                     timed_out = True
                     await self.cancel(owner_id)
                     break
-                arrived = await output.wait(min(no_output_timeout - (now - last_output), timeout - (now - started)))
+                arrived = await output.wait(
+                    min(limits.no_output_timeout - (now - last_output), limits.timeout - (now - started))
+                )
                 batch, finished = output.take()
                 if batch:
                     last_output = time.monotonic()
@@ -468,7 +485,7 @@ class ProcessRunner:
                         await asyncio.sleep(0)
                 if finished:
                     break
-                if not arrived and time.monotonic() - last_output >= no_output_timeout:
+                if not arrived and time.monotonic() - last_output >= limits.no_output_timeout:
                     timed_out = True
                     await self.cancel(owner_id)
                     break

@@ -233,3 +233,133 @@ async def test_a_backup_missing_files_from_the_disc_is_not_accepted(tmp_path: Pa
 
     with pytest.raises(RuntimeError, match="does not hold everything"):
         await service._back_up_data_disc("job-id", drive, job, staging)
+
+
+def _game_disc_job(tmp_path: Path):
+    from test_disc_rescue import _dvd_reader
+    from test_workflow_recovery import make_job, make_service
+
+    from discdock.disc_files import image_files
+    from discdock.models import DiscKind, DriveInfo, MediaKind
+    from discdock.settings import AppSettings
+
+    settings = AppSettings(data_root=tmp_path)
+    settings.resolved_directories()["logs"].mkdir(parents=True, exist_ok=True)
+    staging = tmp_path / "raw" / "disc.partial"
+    staging.mkdir(parents=True)
+    job = make_job(
+        settings, staging, title="Sabeltann", disc_label="SABELTANN",
+        disc_type=DiscKind.DATA.value, media_kind=MediaKind.OTHER.value,
+    )
+    read, total = _dvd_reader()
+    disc_image = bytes(read(0, total))
+    (staging / "probe.iso").write_bytes(disc_image)
+    seen = image_files(staging / "probe.iso")
+    (staging / "probe.iso").unlink()
+    job["metadata"] = {
+        "disc_contents": {
+            "kind": "game",
+            "file_count": seen.file_count,
+            "total_bytes": seen.total_bytes,
+            "entries": [{"path": entry.path, "size": entry.size} for entry in seen.entries],
+        }
+    }
+    service, database = make_service(settings, job)
+    drive = DriveInfo(
+        id="drive-id", letter="D:", name="Drive", media_loaded=True, volume_label="SABELTANN", disc_kind=DiscKind.DATA
+    )
+    return service, database, job, drive, staging, disc_image
+
+
+@pytest.mark.asyncio
+async def test_a_scratched_game_disc_is_rescued_instead_of_failing(tmp_path: Path, monkeypatch) -> None:
+    service, database, job, drive, staging, disc_image = _game_disc_job(tmp_path)
+    rescues: list[dict] = []
+
+    class CrcRipper:
+        def __init__(self, runner) -> None:
+            pass
+
+        async def rip(self, job_id, letter, destination, callback=None):
+            # What Windows said about the Sabeltann disc on 22 September.
+            raise ProcessFailure(
+                "Windows could not read the disc (Data error (cyclic redundancy check))",
+                ProcessResult(["powershell.exe"], 1),
+            )
+
+    class FakeRescue:
+        artifact_paths = staticmethod(media_tools.DvdSectorRescue.artifact_paths)
+
+        def __init__(self, runner) -> None:
+            pass
+
+        async def rip(self, job_id, letter, destination, callback=None, **options):
+            rescues.append(options)
+            destination.write_bytes(disc_image)
+            self.artifact_paths(destination)["map"].write_text("{}", encoding="utf-8")
+            return {"unreadable_bytes": 96 * 1024, "pending_bytes": 0}
+
+    monkeypatch.setattr(workflow_module, "DataDiscRipper", CrcRipper)
+    monkeypatch.setattr(workflow_module, "DvdSectorRescue", FakeRescue)
+
+    await service._back_up_data_disc("job-id", drive, job, staging)
+
+    assert rescues and rescues[0]["whole_disc"] is True and rescues[0]["disc"] == "dvd"
+    image = staging / "Sabeltann.iso"
+    assert image.read_bytes() == disc_image
+    assert sorted(path.name for path in staging.iterdir()) == [
+        "Disc contents.txt", "How to use this backup.txt", "Sabeltann.iso",
+    ], "the rescue's map does not go to the library"
+    how = (staging / "How to use this backup.txt").read_text(encoding="utf-8")
+    assert "96 KB of it could not be read" in how
+    assert database.job["metadata"]["disc_backup"] == {"unreadable_bytes": 96 * 1024}
+    log = (tmp_path / "logs" / "job-id.log").read_text(encoding="utf-8")
+    assert "cyclic redundancy check" in log
+
+
+@pytest.mark.asyncio
+async def test_a_backup_cancelled_by_the_user_is_not_rescued(tmp_path: Path, monkeypatch) -> None:
+    service, _, job, drive, staging, _ = _game_disc_job(tmp_path)
+
+    class CancelledRipper:
+        def __init__(self, runner) -> None:
+            pass
+
+        async def rip(self, job_id, letter, destination, callback=None):
+            raise ProcessFailure("Data-disc imaging failed", ProcessResult(["powershell.exe"], 1, cancelled=True))
+
+    class NoRescue:
+        artifact_paths = staticmethod(media_tools.DvdSectorRescue.artifact_paths)
+
+        def __init__(self, runner) -> None:
+            pytest.fail("a cancelled backup must not start a rescue")
+
+    monkeypatch.setattr(workflow_module, "DataDiscRipper", CancelledRipper)
+    monkeypatch.setattr(workflow_module, "DvdSectorRescue", NoRescue)
+
+    with pytest.raises(ProcessFailure):
+        await service._back_up_data_disc("job-id", drive, job, staging)
+
+
+def test_powershell_errors_are_read_out_of_their_clixml() -> None:
+    from discdock.media_tools import powershell_error
+
+    lines = [
+        "#< CLIXML",
+        (
+            '<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04"><S S="Error">'
+            'Exception calling "Read" with "3" argument(s): "Data error (cyclic redundancy check)._x000D__x000A_</S>'
+        ),
+    ]
+
+    assert powershell_error(lines) == "Data error (cyclic redundancy check)"
+    assert powershell_error(["nothing useful"]) == ""
+
+
+def test_the_disc_is_read_up_to_its_end_and_not_past_it() -> None:
+    import inspect
+
+    source = inspect.getsource(DataDiscRipper.rip)
+
+    # Reading across the end of a CD makes Windows answer "Incorrect function".
+    assert "$left = $Total - $readTotal" in source and "if ($left -le 0) { break }" in source

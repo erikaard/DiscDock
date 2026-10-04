@@ -116,6 +116,8 @@ class MetadataCandidate(BaseModel):
     poster_url: str = ""
     plot: str = ""
     runtime_minutes: int = 0
+    # IMDb votes: among films of the same name, the one people know.
+    votes: int = 0
     user_selected: bool = False
 
 

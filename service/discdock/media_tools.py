@@ -795,7 +795,16 @@ $buffer = New-Object byte[] (4MB)
 $readTotal = [long]0
 $lastPercent = -1
 try {
-  while (($count = $source.Read($buffer, 0, $buffer.Length)) -gt 0) {
+  while ($true) {
+    $want = $buffer.Length
+    if ($Total -gt 0) {
+      # Stop at the end of the disc: a read across it fails with "Incorrect function".
+      $left = $Total - $readTotal
+      if ($left -le 0) { break }
+      $want = [int][Math]::Min([long]$buffer.Length, [Math]::Ceiling($left / 2048.0) * 2048)
+    }
+    $count = $source.Read($buffer, 0, $want)
+    if ($count -le 0) { break }
     $target.Write($buffer, 0, $count)
     $readTotal += $count
     if ($Total -gt 0) {
@@ -840,15 +849,32 @@ try {
             on_line=on_line,
         )
         if result.return_code != 0 or result.cancelled:
-            raise ProcessFailure("Data-disc imaging failed", result)
+            reason = powershell_error(result.lines)
+            raise ProcessFailure(
+                f"Windows could not read the disc ({reason})" if reason else "Data-disc imaging failed", result
+            )
         os.replace(partial, destination)
-        if destination.stat().st_size < 1024 * 1024:
+        # The smallest disc file system (ISO 9660) takes 18 sectors.
+        if destination.stat().st_size < 18 * 2048:
             raise RuntimeError("Data-disc image is unexpectedly small")
         if total and abs(destination.stat().st_size - total) > 2048 * 16:
             raise RuntimeError(
                 f"Data-disc image size does not match the source ({destination.stat().st_size} of {total} bytes)"
             )
         return destination
+
+
+def powershell_error(lines: list[str]) -> str:
+    """The message of the error PowerShell reported, out of its CLIXML error stream.
+
+    ``Exception calling "Read" with "3" argument(s): "Data error (cyclic redundancy
+    check)._x000D__x000A_"`` becomes "Data error (cyclic redundancy check)".
+    """
+    for line in lines:
+        found = re.search(r'Exception calling "\w+" with "\d+" argument\(s\): "(.+?)(?:\._x000D_|_x000D_|")', line)
+        if found:
+            return found.group(1).rstrip(".")
+    return ""
 
 
 async def _invoke(callback: ProgressCallback, event: dict) -> None:

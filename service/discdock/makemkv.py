@@ -7,15 +7,31 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .models import TitleInfo
-from .processes import ProcessFailure, ProcessResult, ProcessRunner
+from .processes import ProcessFailure, ProcessLimits, ProcessResult, ProcessRunner
 
 ROBOT_LINE = re.compile(r"^(?P<record>[A-Z]+):(?P<body>.*)$")
-MAKEMKV_LICENSE_MESSAGE_CODES = {5052, 5053, 5055}
+# "IFO file for VTS #1 is corrupt, VOB file must be scanned. This may take very long time":
+# often copy protection that damages the IFO on purpose. MakeMKV then reads the whole
+# title set without printing anything, which takes as long as reading the disc.
+MAKEMKV_SLOW_SCAN_MESSAGE = "MSG:3042,"
+SLOW_SCAN_SILENCE_SECONDS = 1800
+SLOW_SCAN_TIMEOUT_SECONDS = 3 * 3600
+LICENSE_PROMPT_SILENCE_SECONDS = 60
+# 5052/5053/5055 ask for an evaluation or registration decision; 5021 and 5073 are the free
+# key that MakeMKV ships with running out, which it does every couple of months.
+MAKEMKV_LICENSE_MESSAGE_CODES = {5021, 5052, 5053, 5055, 5073}
+MAKEMKV_EXPIRED_MESSAGE_CODES = {5021, 5073}
+LICENSE_LINE = re.compile(rf"^MSG:({'|'.join(str(code) for code in sorted(MAKEMKV_LICENSE_MESSAGE_CODES))}),")
 MAKEMKV_LICENSE_ACTION = (
     "MakeMKV needs a license decision before DiscDock can continue. Open MakeMKV on Windows "
     "with this disc. If prompted, choose Yes to start its 30-day evaluation; otherwise use "
     "Help > Register with a valid purchased key. Let MakeMKV open the disc once, close MakeMKV, "
     "then Retry in DiscDock."
+)
+MAKEMKV_EXPIRED_ACTION = (
+    "MakeMKV's free key has run out — it says this version is too old. Install the latest MakeMKV "
+    "from makemkv.com, which comes with a new key, or enter a key under Help > Register. Then "
+    "Retry in DiscDock. Nothing is wrong with the disc or with DiscDock."
 )
 
 
@@ -37,6 +53,13 @@ class NoVideoTitles(ProcessFailure):
 
 def has_license_prompt(messages: list[dict]) -> bool:
     return any(message.get("code") in MAKEMKV_LICENSE_MESSAGE_CODES for message in messages)
+
+
+def license_action(messages: list[dict]) -> str:
+    """What to do about MakeMKV's licence, in the words that match what it said."""
+    if any(message.get("code") in MAKEMKV_EXPIRED_MESSAGE_CODES for message in messages):
+        return MAKEMKV_EXPIRED_ACTION
+    return MAKEMKV_LICENSE_ACTION
 
 
 def parse_robot_line(line: str) -> tuple[str, list[str]] | None:
@@ -289,7 +312,7 @@ class MakeMKVClient:
             on_line=on_line,
         )
         if has_license_prompt(parser.scan.messages):
-            raise MakeMKVLicenseError(MAKEMKV_LICENSE_ACTION, result)
+            raise MakeMKVLicenseError(license_action(parser.scan.messages), result)
         if not attributes.is_file() or attributes.stat().st_size == 0:
             raise ProcessFailure("MakeMKV did not save the disc's decryption information", result)
         return attributes
@@ -328,15 +351,26 @@ class MakeMKVClient:
                     await response
 
         args = self._base_args(source) + [f"--minlength={min_length}", "info", source]
+        limits = ProcessLimits(timeout, self.no_output_timeout)
+
+        async def watch(line: str) -> None:
+            if line.startswith(MAKEMKV_SLOW_SCAN_MESSAGE):
+                limits.no_output_timeout = max(limits.no_output_timeout, SLOW_SCAN_SILENCE_SECONDS)
+                limits.timeout = max(limits.timeout, SLOW_SCAN_TIMEOUT_SECONDS)
+            elif LICENSE_LINE.match(line):
+                # A licence question waits for an answer that never comes; stop soon after it.
+                limits.no_output_timeout = min(limits.no_output_timeout, LICENSE_PROMPT_SILENCE_SECONDS)
+            await on_line(line)
+
         result = await self.runner.run(
-            owner_id, args, timeout=timeout, no_output_timeout=self.no_output_timeout, on_line=on_line
+            owner_id, args, timeout=timeout, no_output_timeout=self.no_output_timeout, on_line=watch, limits=limits
         )
         scan = parser.finish()
         # A GUI-style license prompt can leave makemkvcon waiting until our
         # no-output timeout. Classify its robot message before generic timeout
         # and exit-code handling so the user gets the actual recovery action.
         if has_license_prompt(scan.messages):
-            raise MakeMKVLicenseError(MAKEMKV_LICENSE_ACTION, result)
+            raise MakeMKVLicenseError(license_action(scan.messages), result)
         if result.timed_out:
             raise ProcessFailure("MakeMKV inspection timed out", result)
         if result.return_code != 0:
@@ -417,7 +451,7 @@ class MakeMKVClient:
             )
             results.append(result)
             if has_license_prompt(parser.scan.messages):
-                raise MakeMKVLicenseError(MAKEMKV_LICENSE_ACTION, result)
+                raise MakeMKVLicenseError(license_action(parser.scan.messages), result)
             if result.timed_out or result.return_code != 0:
                 raise ProcessFailure("MakeMKV ripping failed", result)
         if not any(path.is_file() and path.stat().st_size > 1024 * 1024 for path in destination.rglob("*")):

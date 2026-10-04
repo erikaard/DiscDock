@@ -288,7 +288,14 @@ async def continue_job(job_id: str, request: ContinueRequest):
         raise HTTPException(409, str(error)) from error
 
 
+# Set when DiscDock is about to close. uvicorn waits for open connections before it
+# stops, and a dashboard's event stream never ends by itself: without this it held
+# every shutdown (and so every update) for ten seconds and ended in a traceback.
+STREAMS_CLOSING = asyncio.Event()
+
+
 def _close_after_answering() -> None:
+    STREAMS_CLOSING.set()
     # uvicorn stops gracefully on SIGINT, like Ctrl+C in a console.
     asyncio.get_running_loop().call_later(0.5, signal.raise_signal, signal.SIGINT)
 
@@ -683,7 +690,7 @@ async def dismiss_notification(notification_id: int):
 async def _event_stream(last_event_id: int, request: Request) -> AsyncIterator[str]:
     cursor = last_event_id
     try:
-        while not await request.is_disconnected():
+        while not STREAMS_CLOSING.is_set() and not await request.is_disconnected():
             events = DATABASE.events_after(cursor)
             if events:
                 for event in events:

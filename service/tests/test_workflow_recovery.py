@@ -630,6 +630,45 @@ async def test_completed_best_effort_reports_skipped_data_and_removes_the_image(
 
 
 @pytest.mark.asyncio
+async def test_a_job_that_reused_an_earlier_rescue_reports_what_that_rescue_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from discdock.disc_rescue import BAD
+
+    settings = AppSettings(
+        data_root=tmp_path, auto_eject=False, skip_transcode=True, duplicate_policy="keep_both"
+    )
+    staging = tmp_path / "raw" / "recovery.partial"
+    # Another job of the same disc did the reading, so this one has no rescue totals of its own.
+    service, database = make_service(settings, make_job(settings, staging, metadata={"recovery": {}}))
+    database.tracks = [{"source_id": 0, "selected": True, "size_bytes": 10, "duration_seconds": 5000}]
+    image = service._rescue_image("job-id", settings)
+    image.parent.mkdir(parents=True)
+    image.write_bytes(b"iso")
+    RescueMap(4096, [(0, 1000, FINISHED), (1000, 1512, BAD), (1512, 4096, FINISHED)]).save(
+        DvdSectorRescue.artifact_paths(image)["map"]
+    )
+
+    async def recover(job_id, drive, active_settings, destination, main_track) -> None:
+        destination.mkdir(parents=True, exist_ok=True)
+        (destination / "recovered.mkv").write_bytes(b"movie")
+
+    async def verified(folder: Path, ffprobe_path: str) -> list[Path]:
+        del ffprobe_path
+        return [folder / "recovered.mkv"]
+
+    service._recover_disc_to_staging = recover  # type: ignore[method-assign]
+    monkeypatch.setattr(workflow_module, "verify_outputs", verified)
+    monkeypatch.setattr(workflow_module, "disk_space_ok", lambda path, required: True)
+    drive = DriveInfo(id="drive-id", letter="D:", name="Drive", media_loaded=False)
+
+    await service._rip_and_finish("job-id", drive, settings, best_effort=True)
+
+    assert database.job["status_detail"] == "Recovered, 1.0 MB of unreadable disc data skipped"
+    assert not image.parent.exists()
+
+
+@pytest.mark.asyncio
 async def test_ai_not_possible_keeps_the_salvaged_movie_for_best_effort(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1737,11 +1776,11 @@ async def test_the_repair_methods_run_in_order_without_waiting_for_the_user(tmp_
     await service._recover_disc_to_staging("job-id", drive, settings, staging, {"source_id": 0})
 
     assert steps == [
-        ("makemkv", "ffmpeg"),
+        ("makemkv", "ffmpeg", "mended"),
         "read the rest: whole_disc=True",
-        ("makemkv", "ffmpeg"),
+        ("makemkv", "ffmpeg", "mended"),
         ("vlc",),
-    ], "the image first, then the rest of the disc, and VLC only when nothing else is left"
+    ], "the image first (as it is, then mended), then the rest of the disc, and VLC only when nothing else is left"
 
 
 @pytest.mark.asyncio
@@ -1823,9 +1862,9 @@ async def test_an_image_finished_early_is_read_further_before_giving_up(tmp_path
 
     assert steps == [
         "read the skipped spots",
-        ("makemkv", "ffmpeg"),
+        ("makemkv", "ffmpeg", "mended"),
         "read the skipped spots",
-        ("makemkv", "ffmpeg"),
+        ("makemkv", "ffmpeg", "mended"),
     ], "the skipped spots are read again before VLC is asked to guess"
 
 

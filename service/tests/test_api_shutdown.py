@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from fastapi import HTTPException
 
@@ -33,3 +35,20 @@ async def test_discdock_does_not_close_while_it_works_on_a_disc(monkeypatch: pyt
     assert refused.value.status_code == 409
     assert "Silje Nergaard - Brevet" in refused.value.detail
     assert closing == []
+
+
+async def test_an_open_dashboard_stream_ends_when_discdock_closes(monkeypatch: pytest.MonkeyPatch) -> None:
+    class StillConnected:
+        async def is_disconnected(self) -> bool:
+            return False
+
+    monkeypatch.setattr(api_module.DATABASE, "events_after", lambda cursor: [])
+    monkeypatch.setattr(api_module, "STREAMS_CLOSING", asyncio.Event())
+    stream = api_module._event_stream(0, StillConnected())
+    assert await stream.__anext__() == ": keepalive\n\n"
+
+    api_module.STREAMS_CLOSING.set()
+
+    # Within a second the stream ends, so uvicorn can stop without its ten-second wait.
+    with pytest.raises(StopAsyncIteration):
+        await asyncio.wait_for(stream.__anext__(), timeout=3)

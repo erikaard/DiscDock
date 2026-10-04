@@ -158,8 +158,8 @@ export function SettingsView({ settings, health, busy, controls }: {
         </Section>
 
         <Section icon={Wrench} eyebrow="Disc selection" title="Titles and extras" description="These defaults can still be overridden for a manual job.">
-          <ToggleRow label="Select main feature" detail="Rip exactly one likely feature, using OMDb runtime when available and filtering duplicate angles." checked={draft.main_feature} onChange={(value) => setDraft((current) => ({ ...current, main_feature: value, ...(value ? { extras: false } : {}) }))} />
-          <ToggleRow label="Include extras and episodes" detail="Keep every title that passes the duration filter instead of choosing one feature." checked={draft.extras && !draft.main_feature} onChange={(value) => setDraft((current) => ({ ...current, extras: value, ...(value ? { main_feature: false } : {}) }))} />
+          <ToggleRow label="Select main feature" detail="Rip the film itself: the title closest to its OMDb running time, or the longest. A series gets every episode, without its play-all." checked={draft.main_feature} onChange={(value) => setDraft((current) => ({ ...current, main_feature: value, ...(value ? { extras: false } : {}) }))} />
+          <ToggleRow label="Include extras and episodes" detail="Keep every title that passes the duration filter instead of choosing one feature. A film listed several times on the disc is still ripped once." checked={draft.extras && !draft.main_feature} onChange={(value) => setDraft((current) => ({ ...current, extras: value, ...(value ? { main_feature: false } : {}) }))} />
           <ToggleRow label="Always choose titles" detail="Every disc waits on the dashboard, as Choose titles does, listing the titles between the two lengths below with the ones above already ticked." checked={draft.always_choose_titles} onChange={(value) => update("always_choose_titles", value)} />
           <div className="grid gap-4 pt-2 sm:grid-cols-2">
             <Field label="Minimum title length (minutes)">

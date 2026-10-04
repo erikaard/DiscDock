@@ -1019,6 +1019,59 @@ def dvd_titles(read: ReadSectors, files: dict[str, DiscFile]) -> list[DvdTitle]:
     return titles
 
 
+def dvd_title_contents(folder: Path) -> dict[int, tuple[int, list[tuple[int, int]]]]:
+    """What each DVD title plays, from the IFO files of a VIDEO_TS folder.
+
+    Maps the disc's title number to its title set and the sector ranges of its cells,
+    counted from the start of that title set's video. Titles that play the same sectors
+    are one video, whatever MakeMKV calls them (Disney discs list a film once per
+    credits language); titles that share no sectors are different episodes, however
+    alike their lengths. Empty when the folder cannot be read.
+    """
+    names = ["VIDEO_TS.IFO"]
+    try:
+        names += sorted({path.name.upper() for path in folder.glob("VTS_*_0.IFO")})
+    except OSError:
+        return {}
+    # The parsers read sectors of a disc, so the IFO files are laid out one after another.
+    disc = bytearray()
+    files: dict[str, DiscFile] = {}
+    for name in names:
+        try:
+            data = (folder / name).read_bytes()
+        except OSError:
+            if name == "VIDEO_TS.IFO":
+                return {}
+            continue
+        if len(data) > 4096 * SECTOR_SIZE:
+            continue
+        files[name] = DiscFile(name, [(len(disc) // SECTOR_SIZE, len(data))])
+        disc += data + bytes(-len(data) % SECTOR_SIZE)
+        if name != "VIDEO_TS.IFO":
+            # Cells count from their title set's first video sector, which is all a comparison needs.
+            files[name.replace("_0.IFO", "_1.VOB")] = DiscFile(name.replace("_0.IFO", "_1.VOB"), [(0, SECTOR_SIZE)])
+
+    def read(lba: int, count: int) -> bytes:
+        return bytes(disc[lba * SECTOR_SIZE : (lba + count) * SECTOR_SIZE]).ljust(count * SECTOR_SIZE, b"\0")
+
+    contents: dict[int, tuple[int, list[tuple[int, int]]]] = {}
+    try:
+        header = read(0, 1)
+        if header[:12] != b"DVDVIDEO-VMG" or _be32(header, 0xC4) <= 0:
+            return {}
+        count = min(99, _be16(read(_be32(header, 0xC4), 1), 0))
+        for number in range(1, count + 1):
+            entry = dvd_title_entry(read, files, number)
+            if not entry:
+                continue
+            cells = dvd_title_cells(read, files, entry[0], entry[1], entry[2])
+            if cells:
+                contents[number] = (entry[0], cells)
+    except (OpticalError, ValueError, IndexError):
+        return contents
+    return contents
+
+
 def dvd_longest_title(read: ReadSectors, files: dict[str, DiscFile]) -> int:
     """The DVD title with the longest playback time, for a disc MakeMKV could not open."""
     titles = dvd_titles(read, files)

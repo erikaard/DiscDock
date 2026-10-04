@@ -1012,3 +1012,98 @@ async def test_always_choose_titles_stops_every_disc_at_the_title_list(tmp_path:
 def test_always_choose_titles_is_off_unless_it_is_turned_on() -> None:
     assert AppSettings().always_choose_titles is False
     assert AppSettings(always_choose_titles=True).always_choose_titles is True
+
+
+def test_a_movie_the_disc_mostly_gave_keeps_its_plain_name() -> None:
+    from discdock.workflow import library_title
+
+    job = {
+        "title": "Bob the Builder",
+        "metadata": {"damage": {"moments": [
+            {"start_seconds": 846.7, "end_seconds": 863.1, "duration_seconds": 16.4, "missing_seconds": 16.4},
+            {"start_seconds": 891.7, "end_seconds": 909.6, "duration_seconds": 17.8, "missing_seconds": 17.8},
+        ]}},
+    }
+
+    assert library_title(job) == "Bob the Builder", "half a minute on a scratched disc is not worth a warning"
+
+
+def test_a_movie_with_a_minute_missing_says_so_in_its_name() -> None:
+    from discdock.workflow import library_title
+
+    job = {
+        "title": "Winter, the Dolphin That Can",
+        "metadata": {"damage": {"moments": [
+            {"start_seconds": 1596, "end_seconds": 1634, "duration_seconds": 38.4, "missing_seconds": 38.4},
+            {"start_seconds": 1647, "end_seconds": 1689, "duration_seconds": 42.4, "missing_seconds": 42.4},
+        ]}},
+    }
+
+    assert library_title(job) == "Winter, the Dolphin That Can [damaged]"
+    # The name is built once; finishing the same job again must not stack the note.
+    assert library_title({**job, "title": library_title(job)}) == "Winter, the Dolphin That Can [damaged]"
+
+
+def test_a_short_film_is_judged_against_its_own_length() -> None:
+    from discdock.workflow import library_title
+
+    moments = [{"start_seconds": 10, "end_seconds": 55, "duration_seconds": 45, "missing_seconds": 45}]
+    short = {"title": "An Episode", "metadata": {"damage": {"moments": moments}, "runtime_minutes": 22}}
+    feature = {"title": "A Feature", "metadata": {"damage": {"moments": moments}, "runtime_minutes": 180}}
+
+    assert library_title(short) == "An Episode [damaged]", "45 seconds of a 22-minute episode is a lot"
+    assert library_title(feature) == "A Feature", "the same gap in a three-hour film is not"
+
+
+def test_a_movie_with_no_damage_at_all_is_never_marked() -> None:
+    from discdock.workflow import library_title
+
+    assert library_title({"title": "Clean Disc", "metadata": {}}) == "Clean Disc"
+
+
+def test_an_expired_makemkv_key_is_explained_as_such() -> None:
+    from discdock.makemkv import (
+        MAKEMKV_EXPIRED_ACTION,
+        MAKEMKV_LICENSE_ACTION,
+        has_license_prompt,
+        license_action,
+    )
+
+    # What MakeMKV prints when the free key it ships with runs out.
+    expired = [
+        {"code": 5073, "message": "Your temporary key has expired and was removed. Please restart the application."},
+        {"code": 5021, "message": "This application version is too old.  Please download the latest version..."},
+    ]
+    evaluation = [{"code": 5052, "message": "Evaluation period has expired"}]
+
+    assert has_license_prompt(expired) and license_action(expired) == MAKEMKV_EXPIRED_ACTION
+    assert "makemkv.com" in MAKEMKV_EXPIRED_ACTION and "Nothing is wrong with the disc" in MAKEMKV_EXPIRED_ACTION
+    assert has_license_prompt(evaluation) and license_action(evaluation) == MAKEMKV_LICENSE_ACTION
+    assert not has_license_prompt([{"code": 3007, "message": "Using direct disc access mode"}])
+
+
+@pytest.mark.parametrize(
+    ("minutes", "runtime", "expected"),
+    [
+        # The other user's discs, as OMDb mismatched them: the extra came closest to the wrong film.
+        ([83.5, 13.9], 7, 83.5),     # Cats & Dogs, matched to a 1932 cartoon
+        ([126.5, 15.0], 44, 126.5),  # A Knight's Tale, matched to Bob the Builder
+        # The right runtimes pick the same feature.
+        ([83.5, 13.9], 87, 83.5),
+        ([126.5, 15.0], 132, 126.5),
+        # And the runtime still beats "longest" where it should: Finding Nemo's play-all composite.
+        ([130.7, 95.5, 35.0], 100, 95.5),
+    ],
+)
+def test_a_running_time_that_fits_nothing_on_the_disc_is_ignored(
+    minutes: list[float], runtime: int, expected: float
+) -> None:
+    settings = AppSettings(min_length_seconds=600, max_length_seconds=99999, main_feature=True)
+    titles = [
+        TitleInfo(id=index, duration_seconds=round(value * 60), size_bytes=int(value * 50_000_000), chapters=10)
+        for index, value in enumerate(minutes)
+    ]
+
+    chosen = select_disc_titles(titles, settings, runtime)
+
+    assert [round(title.duration_seconds / 60, 1) for title in chosen] == [expected]
