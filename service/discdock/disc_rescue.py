@@ -44,6 +44,7 @@ from typing import Any, BinaryIO
 from .optical import (
     DVD_ECC_BLOCK_SECTORS,
     SECTOR_SIZE,
+    SLOWEST_READ_KBPS,
     CopyProtectionError,
     DriveFaultError,
     MediaUnavailableError,
@@ -1140,6 +1141,27 @@ class RescueEngine:
                 position += count
         self.stop_reason = self.stop_reason or "finished"
 
+    def _slowly(self, retry: Callable[[], None]) -> None:
+        """Retry at the drive's slowest read speed, then give the drive its own speed back.
+
+        A block a drive cannot read at full speed often reads when it spins slowly, the
+        more so on a weak or dusty drive. Full speed comes back however the retry ends.
+        """
+        try:
+            slowed = bool(self.device.set_read_speed(SLOWEST_READ_KBPS))
+        except OSError:
+            slowed = False
+        self.emit({"type": "speed", "slow": True, "accepted": slowed})
+        try:
+            retry()
+        finally:
+            if slowed:
+                try:
+                    self.device.set_read_speed(None)
+                except OSError:
+                    pass
+                self.emit({"type": "speed", "slow": False, "accepted": True})
+
     def _retry_critical(self) -> None:
         """Read navigation and filesystem sectors first; a few failed blocks there make the image unusable."""
         assert self.map is not None
@@ -1208,9 +1230,9 @@ class RescueEngine:
                     self.map.meta["swept_ranges"] = [list(span) for span in merge_ranges(swept)]
                     self.map.meta["sweep_done"] = True
                     self._save(force=True)
-                if self.critical:
+                if self.critical and _intersect(self.map.areas(PENDING | {BAD}), self.critical):
                     self.phase = "structures"
-                    self._retry_critical()
+                    self._slowly(self._retry_critical)
                     self._save(force=True)
                 if not self._pending_relevant():
                     self.stop_reason = "finished"
@@ -1219,7 +1241,7 @@ class RescueEngine:
                 else:
                     self.extra_started = self.clock()
                     self._pending_at_extra_start = self._pending_relevant()
-                    self._retry()
+                    self._slowly(self._retry)
             except RescueFinishRequested:
                 finished_early = True
                 self.stop_reason = "skipped"

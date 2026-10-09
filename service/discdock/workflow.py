@@ -62,6 +62,7 @@ from .makemkv import (
     MakeMKVClient,
     MakeMKVLicenseError,
     NoVideoTitles,
+    corrupt_spot,
     match_title,
     navigation_skipped,
 )
@@ -100,9 +101,11 @@ from .notifications import NotificationService
 from .optical import (
     SECTOR_SIZE,
     OpticalError,
+    dvd_folder_video_scrambled,
     dvd_title_contents,
     dvd_title_video_ranges,
     dvd_titles,
+    dvd_titles_in_folder,
     dvd_video_scrambled,
     merge_ranges,
     read_video_ts_files,
@@ -432,12 +435,14 @@ def _user_metadata_candidate(job: dict[str, Any]) -> MetadataCandidate | None:
 
 
 def _is_disc_read_warning(message: str) -> bool:
+    # MakeMKV translates "Scsi error" ("Scsi feil", "SCSI-Fehler") but passes on the drive's
+    # own sense words, such as "MEDIUM ERROR", as they are.
     lowered = message.casefold()
     return any(
         marker in lowered
         for marker in (
             "l-ec uncorrectable error",
-            "scsi error - medium error",
+            "medium error",
             "status_device_data_error",
         )
     )
@@ -459,11 +464,22 @@ def _drive_stopped_responding(lines: list[str]) -> bool:
 
 
 # "IFO file for VTS #1 is corrupt, VOB file must be scanned": MakeMKV then rebuilds the disc's
-# navigation from its video and prints nothing until it lists the titles, often for minutes.
+# navigation from its video, often for minutes. It reports each title as it gets to it, and the
+# slow one can come last, so the step ends only once it is done with the whole disc:
+# "Operation successfully completed", "Failed to open disc", or the scan's title count.
 NAVIGATION_REBUILD_START = "MSG:3042,"
-NAVIGATION_REBUILD_END = ("MSG:3015,", "MSG:3025,", "MSG:3028,", "TCOUNT:")
+NAVIGATION_REBUILD_END = ("MSG:5011,", "MSG:5010,", "TCOUNT:")
 # A new MakeMKV run ends any rebuild the last one was in.
 MAKEMKV_STARTED = "MSG:1005,"
+# "Region setting of drive ... does not match the region of currently inserted disc, trying to
+# work around...". MakeMKV also says this when Windows reads a disc just as it goes in, and
+# may then say nothing until the scan is stopped; scanned again, the disc opens normally.
+REGION_WORKAROUND = "MSG:3032,"
+REGION_WORKAROUND_DETAIL = "MakeMKV says the drive's region does not match the disc and is working around it"
+
+
+def _stalled_after_region_message(error: ProcessFailure) -> bool:
+    return error.result.timed_out and any(line.startswith(REGION_WORKAROUND) for line in error.result.lines)
 DEFAULT_REBUILD_SECONDS = 360.0
 REBUILD_TICK_SECONDS = 3.0
 
@@ -521,9 +537,8 @@ class ImageNotDecryptable(RuntimeError):
     """MakeMKV keeps failing on one spot of a rescued image; reading more of the disc cannot help."""
 
 
-# MakeMKV prints this once for each damaged spot it skips. Hundreds of repeats for
+# MakeMKV reports each damaged spot it skips (see corrupt_spot). Hundreds of repeats for
 # the same offset mean it is stuck there, for example on a copy-protected Blu-ray.
-MAKEMKV_CORRUPT_SPOT = re.compile(r"The source file '([^']+)' is corrupt or invalid at offset (\d+)")
 MAKEMKV_STUCK_REPEATS = 200
 
 
@@ -1272,6 +1287,8 @@ class DiscDockService:
         ):
             # For example the drive failing to read while the rescue finds the movie.
             self.database.update_job(job_id, status_detail=message)
+        if message.startswith(REGION_WORKAROUND):
+            self.database.update_job(job_id, status_detail=REGION_WORKAROUND_DETAIL)
         if event_type == "stage":
             self.database.update_job(job_id, status_detail=message or "Working")
         elif (
@@ -1374,6 +1391,7 @@ class DiscDockService:
                 # Decrypting a Blu-ray can keep MakeMKV silent for minutes on a slow drive, and
                 # so can a copy-protected DVD while it sorts out dozens of decoy titles.
                 make_mkv.no_output_timeout = max(make_mkv.no_output_timeout, 600)
+            region_stalled = False
             for attempt in range(FEATURE_RESCANS + 1):
                 try:
                     scan = await make_mkv.inspect(
@@ -1387,6 +1405,10 @@ class DiscDockService:
                 except MakeMKVLicenseError:
                     raise
                 except ProcessFailure as error:
+                    if not region_stalled and attempt < FEATURE_RESCANS and _stalled_after_region_message(error):
+                        region_stalled = True
+                        await self._scan_again_after_region_stall(job_id, attempt)
+                        continue
                     skipped = _skipped_feature(error.result.lines, [], settings)
                     if skipped and attempt < FEATURE_RESCANS and not _drive_stopped_responding(error.result.lines):
                         await self._scan_again_for_feature(job_id, skipped, attempt)
@@ -1420,9 +1442,130 @@ class DiscDockService:
                 if skipped and attempt < FEATURE_RESCANS:
                     await self._scan_again_for_feature(job_id, skipped, attempt)
                     continue
+                if skipped and await self._film_in_disc_tables(job_id, drive, skipped):
+                    self._record_skipped_feature(job_id, 0)
+                    break
                 self._record_skipped_feature(job_id, skipped)
                 return scan
         return await self._scan_rescued_structures(job_id, drive, settings)
+
+    async def _film_in_disc_tables(self, job_id: str, drive: DriveInfo, skipped: int) -> bool:
+        """Whether the DVD's own navigation lists a title as long as the one MakeMKV keeps leaving out.
+
+        Denver, the Last Dinosaur starts its title with a chain of jump commands and no video.
+        MakeMKV calls that navigation corrupt and loses the title on every scan, and VLC's
+        DVD library stops on it. DiscDock's own reader takes the title from the disc's
+        tables instead, through the rescue route. A damaged disc is left alone here.
+        """
+        job = self.database.get_job(job_id) or {}
+        if drive.disc_kind != DiscKind.DVD or _has_disc_read_warning(job):
+            return False
+        folder = Path(f"{drive.letter.rstrip(':')}:/") / "VIDEO_TS"
+        try:
+            titles = await asyncio.wait_for(asyncio.to_thread(dvd_titles_in_folder, folder), timeout=30)
+        except (TimeoutError, OSError):
+            return False
+        longest = max(titles, key=lambda title: title.duration_seconds, default=None)
+        if longest is None or longest.duration_seconds < skipped * 0.9:
+            return False
+        try:
+            scrambled = await asyncio.wait_for(
+                asyncio.to_thread(dvd_folder_video_scrambled, folder, longest.title_set), timeout=60
+            )
+        except TimeoutError:
+            scrambled = True
+        if scrambled:
+            # FFmpeg would copy noise: only MakeMKV decrypts here, and it cannot see the title.
+            await asyncio.to_thread(
+                self._append_log,
+                job_id,
+                f"The disc's own tables list DVD title {longest.number} at "
+                f"{_format_duration(longest.duration_seconds)}, but its video is copy-protected, so it is "
+                "left to a choice",
+            )
+            return False
+        metadata = dict(job.get("metadata") or {})
+        metadata["titles_from_tables"] = True
+        self.database.update_job(job_id, metadata_json=json.dumps(metadata, ensure_ascii=False))
+        await asyncio.to_thread(
+            self._append_log,
+            job_id,
+            f"MakeMKV cannot follow this disc's navigation to the {_format_duration(skipped)} title; the disc's "
+            f"own tables list DVD title {longest.number} at {_format_duration(longest.duration_seconds)}. Reading "
+            "the disc with DiscDock's own reader and copying that title out with FFmpeg",
+        )
+        return True
+
+    async def _rip_with_makemkv(
+        self,
+        job_id: str,
+        drive: DriveInfo,
+        settings: AppSettings,
+        staging: Path,
+        tracks: list[dict[str, Any]],
+        selected_ids: list[int],
+        job: dict[str, Any],
+    ) -> None:
+        """Rip the chosen titles, again when MakeMKV's second look at the disc lost them.
+
+        MakeMKV analyses the disc again when it rips. On a disc whose navigation it has to
+        rebuild (Ghostbusters II, The Karate Kid Part II) that second look can leave the
+        film out "due to navigation error", so the rip finds nothing, or rips another title
+        under the film's number. Another run usually sees the disc as the scan did.
+        """
+        for attempt in range(FEATURE_RESCANS + 1):
+            try:
+                results = await self._make_mkv(settings).rip(
+                    job_id,
+                    drive.letter,
+                    staging,
+                    selected_ids,
+                    settings.rip_timeout_seconds,
+                    callback=lambda event: self._process_event(job_id, event),
+                    backup=settings.rip_mode == "backup",
+                    # Title ids come from a scan filtered by this length.
+                    min_length=settings.min_length_seconds,
+                )
+                latest = self.database.get_job(job_id) or job
+                if (latest.get("metadata") or {}).get("ai_repair_requested"):
+                    raise ProcessFailure("Switching to AI repair preparation", results[-1])
+                if (latest.get("metadata") or {}).get("recovery_requested"):
+                    raise ProcessFailure("Switching to damaged-disc recovery", results[-1])
+                if settings.rip_mode != "backup":
+                    await self._check_ripped_title(job_id, staging, tracks, settings)
+                return
+            except MakeMKVLicenseError:
+                raise
+            except (ProcessFailure, WrongTitleRipped) as error:
+                latest = self.database.get_job(job_id) or job
+                metadata = latest.get("metadata") or {}
+                switching = bool(metadata.get("ai_repair_requested") or metadata.get("recovery_requested"))
+                lost = isinstance(error, WrongTitleRipped) or (
+                    isinstance(error, ProcessFailure)
+                    and not error.result.cancelled
+                    and not _drive_stopped_responding(error.result.lines)
+                    and bool(navigation_skipped(error.result.lines))
+                )
+                if switching or not lost or attempt == FEATURE_RESCANS:
+                    raise
+                lines = error.result.lines if isinstance(error, ProcessFailure) else []
+                skipped = max(navigation_skipped(lines), default=0)
+                await asyncio.to_thread(
+                    self._append_log,
+                    job_id,
+                    (
+                        f"MakeMKV left out the {_clock(skipped)} title \"due to navigation error\" when it looked at "
+                        "the disc again to rip it"
+                        if skipped
+                        else "MakeMKV ripped another title than the one chosen"
+                    )
+                    + f"; ripping again ({attempt + 2} of {FEATURE_RESCANS + 1})",
+                )
+                self.database.update_job(
+                    job_id, status_detail="MakeMKV lost the film when it looked at the disc again; ripping again"
+                )
+                for leftover in staging.glob("*.mkv"):
+                    leftover.unlink(missing_ok=True)
 
     async def _check_ripped_title(
         self, job_id: str, staging: Path, tracks: list[dict[str, Any]], settings: AppSettings
@@ -1468,6 +1611,16 @@ class DiscDockService:
         self.database.update_job(
             job_id, status_detail=f"MakeMKV left out the {_format_duration(skipped)} film; scanning the disc again"
         )
+
+    async def _scan_again_after_region_stall(self, job_id: str, attempt: int) -> None:
+        await asyncio.to_thread(
+            self._append_log,
+            job_id,
+            "MakeMKV stopped answering after saying the drive's region does not match the disc. That often "
+            "happens when Windows reads a disc just as it goes in. Scanning the disc again "
+            f"({attempt + 2} of {FEATURE_RESCANS + 1})",
+        )
+        self.database.update_job(job_id, status_detail="MakeMKV stopped answering; scanning the disc again")
 
     def _record_skipped_feature(self, job_id: str, skipped: int) -> None:
         """Remember a film MakeMKV would not list, so nothing shorter is ripped in its place."""
@@ -1696,11 +1849,17 @@ class DiscDockService:
         metadata = dict(job.get("metadata") or {})
         metadata["titles_from_rescue"] = True
         metadata["requested_rip_method"] = "sector_rescue"
+        # A disc whose navigation MakeMKV cannot follow is not necessarily damaged.
+        from_tables = bool(metadata.get("titles_from_tables"))
         self.database.update_job(
             job_id,
             state=JobState.RIPPING,
             stage="recovering",
-            status_detail="Reading the damaged disc's file system and navigation data",
+            status_detail=(
+                "Reading the disc's file system and navigation data"
+                if from_tables
+                else "Reading the damaged disc's file system and navigation data"
+            ),
             progress=0,
             metadata_json=json.dumps(metadata, ensure_ascii=False),
             recoverable=1,
@@ -1711,6 +1870,27 @@ class DiscDockService:
         )
         await self._run_sector_rescue(job_id, drive, settings, image, None, structures_only=True, extra_seconds=0)
         partial = DvdSectorRescue.artifact_paths(image)["partial"]
+        if from_tables:
+            # MakeMKV would lose the title in a copy of the disc just as it did on the disc.
+            scan = await asyncio.to_thread(self._titles_from_disc_tables, partial if partial.is_file() else image)
+            if scan is not None:
+                await asyncio.to_thread(
+                    self._append_log,
+                    job_id,
+                    "The disc's own tables list "
+                    + ", ".join(
+                        f"title {title.disc_title_number} ({_format_duration(title.duration_seconds)})"
+                        for title in scan.titles[:8]
+                    ),
+                )
+                self.database.update_job(
+                    job_id,
+                    state=JobState.INSPECTING,
+                    stage="inspecting",
+                    status_detail="Titles found in the disc's own navigation",
+                    progress=0,
+                )
+                return scan
         scan = await self._scan_image(job_id, settings, partial if partial.is_file() else image)
         if scan is None:
             await asyncio.to_thread(
@@ -2711,11 +2891,11 @@ class DiscDockService:
         stuck: list[str] = []
 
         async def scan_event(event: dict) -> None:
-            spot = MAKEMKV_CORRUPT_SPOT.search(str(event.get("message") or ""))
+            spot = corrupt_spot(str(event.get("message") or ""))
             if spot:
-                count = repeats[spot.groups()] = repeats.get(spot.groups(), 0) + 1
+                count = repeats[spot] = repeats.get(spot, 0) + 1
                 if count == MAKEMKV_STUCK_REPEATS:
-                    stuck.append(f"{spot.group(1)} at offset {spot.group(2)}")
+                    stuck.append(f"{spot[0]} at offset {spot[1]}")
                     await self.runner.cancel(job_id)
                 if count >= MAKEMKV_STUCK_REPEATS:
                     return
@@ -2725,7 +2905,11 @@ class DiscDockService:
         extracted = staging / ".rescued-title.partial"
         if extracted.exists():
             await asyncio.to_thread(shutil.rmtree, extracted)
-        is_dvd = (self.database.get_job(job_id) or {}).get("disc_type") == DiscKind.DVD
+        job = self.database.get_job(job_id) or {}
+        is_dvd = job.get("disc_type") == DiscKind.DVD
+        if (job.get("metadata") or {}).get("titles_from_tables"):
+            # MakeMKV never listed this title and would not find it in the image or a mended copy either.
+            methods = tuple(method for method in methods if method not in {"makemkv", "mended"})
         problems = problems if problems is not None else []
         extraction_done = False
         if "makemkv" in methods:
@@ -2835,6 +3019,13 @@ class DiscDockService:
                 match = match_title(scan.titles, main_track)
                 if match is None:
                     raise RuntimeError("MakeMKV could not find the selected movie in the rescued disc image")
+                wanted = int(main_track.get("duration_seconds") or 0)
+                if match.duration_seconds < wanted * 0.5:
+                    # Same DVD title number, but MakeMKV lost most of it (Denver, the Last Dinosaur).
+                    raise RuntimeError(
+                        f"MakeMKV lists DVD title {match.disc_title_number or '?'} as "
+                        f"{_clock(match.duration_seconds)} long, not the {_clock(wanted)} chosen"
+                    )
                 await asyncio.to_thread(
                     self._append_log,
                     job_id,
@@ -3406,24 +3597,7 @@ class DiscDockService:
         elif disc_kind == DiscKind.DATA:
             await self._back_up_data_disc(job_id, drive, job, staging)
         else:
-            results = await self._make_mkv(settings).rip(
-                job_id,
-                drive.letter,
-                staging,
-                selected_ids,
-                settings.rip_timeout_seconds,
-                callback=lambda event: self._process_event(job_id, event),
-                backup=settings.rip_mode == "backup",
-                # Title ids come from a scan filtered by this length.
-                min_length=settings.min_length_seconds,
-            )
-            latest = self.database.get_job(job_id) or job
-            if (latest.get("metadata") or {}).get("ai_repair_requested"):
-                raise ProcessFailure("Switching to AI repair preparation", results[-1])
-            if (latest.get("metadata") or {}).get("recovery_requested"):
-                raise ProcessFailure("Switching to damaged-disc recovery", results[-1])
-            if settings.rip_mode != "backup":
-                await self._check_ripped_title(job_id, staging, tracks, settings)
+            await self._rip_with_makemkv(job_id, drive, settings, staging, tracks, selected_ids, job)
 
         self.database.update_job(
             job_id,

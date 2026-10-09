@@ -262,3 +262,13 @@ async def test_passing_omdb_errors_are_not_cached_and_dropped_connections_are_re
 
     assert second["Error"] == "Movie not found!" and len(requests) == 3, "the passing error was asked again"
     assert len(cache.stored) == 1 and "Movie not found!" in cache.stored[0], "only the lasting answer is kept"
+
+
+def test_an_edition_in_brackets_is_not_part_of_the_title() -> None:
+    # What MakeMKV reads from discs labelled DVD_VIDEO.
+    assert title_from_label("The Karate Kid (Special Edition)") == ("The Karate Kid", "")
+    assert title_from_label("Ghostbusters 2 - Special Edition") == ("Ghostbusters 2", "")
+    assert title_from_label("Toy Story: Special Edition") == ("Toy Story", "")
+    assert title_from_label("Shrek 2 [Blu-ray]") == ("Shrek 2", "")
+    assert title_from_label("Cars (2006)") == ("Cars", "2006")
+    assert title_from_label("SPIDER-MAN_3") == ("Spider-Man 3", "")

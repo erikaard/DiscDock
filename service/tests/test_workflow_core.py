@@ -172,6 +172,16 @@ def test_uncorrectable_medium_error_is_a_dashboard_warning() -> None:
     assert not _is_disc_read_warning("Saving to MKV file")
 
 
+def test_a_medium_error_is_a_read_warning_in_every_language_makemkv_speaks() -> None:
+    # MakeMKV translates "Scsi error" but passes the drive's own sense words on as they are.
+    assert _is_disc_read_warning(
+        "MSG:2003,0,3,\"Feil 'Scsi feil - MEDIUM ERROR:UNRECOVERED READ ERROR' oppstod med lesing "
+        "'/VIDEO_TS/VTS_01_1.VOB' ved offset '1463154688'\""
+    )
+    assert _is_disc_read_warning("SCSI-Fehler - MEDIUM ERROR")
+    assert _is_disc_read_warning("Scsi エラー (MEDIUM ERROR:L-EC UNCORRECTABLE ERROR)")
+
+
 def test_dvd_recovery_title_number_is_restored_from_an_existing_job_log(
     tmp_path: Path,
 ) -> None:

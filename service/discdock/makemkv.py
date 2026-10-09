@@ -13,7 +13,8 @@ ROBOT_LINE = re.compile(r"^(?P<record>[A-Z]+):(?P<body>.*)$")
 # "IFO file for VTS #1 is corrupt, VOB file must be scanned. This may take very long time":
 # often copy protection that damages the IFO on purpose. MakeMKV then reads the whole
 # title set without printing anything, which takes as long as reading the disc.
-MAKEMKV_SLOW_SCAN_MESSAGE = "MSG:3042,"
+# "Complex multiplex encountered - 2 cells and 1170 VOBUs have to be scanned" is another such silence.
+MAKEMKV_SLOW_SCAN_MESSAGE = ("MSG:3042,", "MSG:3024,")
 SLOW_SCAN_SILENCE_SECONDS = 1800
 SLOW_SCAN_TIMEOUT_SECONDS = 3 * 3600
 LICENSE_PROMPT_SILENCE_SECONDS = 60
@@ -64,6 +65,24 @@ NAVIGATION_SKIPPED = re.compile(r'^MSG:3015,.*?\((\d+:\d{2}:\d{2})\)')
 def navigation_skipped(lines: list[str]) -> list[int]:
     """How long each title was, in seconds, that MakeMKV left out because of a navigation error."""
     return [parse_duration(found.group(1)) for line in lines if (found := NAVIGATION_SKIPPED.match(line))]
+
+
+# "The source file '%1' is corrupt or invalid at offset %2, attempting to work around".
+# MakeMKV translates the sentence, but not the values it fills in, which follow it on the line.
+MAKEMKV_CORRUPT_SOURCE = "4004"
+CORRUPT_SPOT_TEXT = re.compile(r"'([^']+)'\D*(\d+)")
+
+
+def corrupt_spot(line: str) -> tuple[str, str] | None:
+    """The file and offset of a damaged spot MakeMKV is working around, in any of its languages."""
+    parsed = parse_robot_line(line)
+    if not parsed or parsed[0] != "MSG" or len(parsed[1]) < 4 or parsed[1][0] != MAKEMKV_CORRUPT_SOURCE:
+        return None
+    fields = parsed[1]
+    if len(fields) >= 7:
+        return fields[5], fields[6]
+    found = CORRUPT_SPOT_TEXT.search(fields[3])
+    return (found.group(1), found.group(2)) if found else None
 
 
 def license_action(messages: list[dict]) -> str:

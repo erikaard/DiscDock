@@ -403,6 +403,15 @@ def describe_rescue_event(event: dict) -> str:
             f"Unreadable spot near {_gigabytes(int(event.get('start_bytes') or 0))}; "
             "skipping to the next moment of video and retrying it later"
         )
+    if kind == "speed":
+        if not event.get("slow"):
+            return "The drive is back at its full read speed"
+        if event.get("accepted"):
+            return (
+                "Retrying at the drive's slowest read speed: a block that will not read at full speed "
+                "often does slowly"
+            )
+        return "The drive does not let its read speed be lowered; retrying at its normal speed"
     if kind == "waiting":
         return str(event.get("message") or "Waiting for the optical drive")
     if kind == "adopting":

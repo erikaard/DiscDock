@@ -11,6 +11,8 @@ import discdock.workflow as workflow_module
 from discdock.database import Database
 from discdock.makemkv import DiscScan
 from discdock.models import DiscKind, DriveInfo, TitleInfo
+from discdock.optical import DvdTitle
+from discdock.processes import ProcessFailure, ProcessResult
 from discdock.secrets import SecretStore
 from discdock.settings import AppSettings, SettingsStore
 from discdock.workflow import (
@@ -207,11 +209,23 @@ async def test_makemkvs_silent_rebuild_is_shown_as_a_step_with_progress(tmp_path
     assert database.job["status_detail"].endswith("of about 7:30")
     assert 0 <= database.job["progress"] < 5
 
+    # Denver, the Last Dinosaur: a short title is reported 26 seconds in, then MakeMKV
+    # works on the next one for three and a half minutes more.
+    await service._process_event(
+        "job-id", {"type": "msg", "message": 'MSG:3025,0,3,"Title #2/1 has length of 84 seconds"'}
+    )
     await service._process_event("job-id", {"type": "msg", "message": 'MSG:3028,0,3,"Title #1 was added (1:43:40)"'})
+    await asyncio.sleep(0.05)
+    assert database.job["metadata"]["navigation_rebuild_seconds"] == 450, "a title reported on the way is not the end"
+    assert "job-id" in service._rebuilds
+
+    await service._process_event(
+        "job-id", {"type": "msg", "message": 'MSG:5011,0,0,"Operation successfully completed"'}
+    )
     database.job["status_detail"] = "Saving to MKV file"
     await asyncio.sleep(0.05)
 
-    assert database.job["status_detail"] == "Saving to MKV file", "the step ends when MakeMKV lists the titles"
+    assert database.job["status_detail"] == "Saving to MKV file", "the step ends when MakeMKV has looked at all of it"
     assert database.job["metadata"]["navigation_rebuild_seconds"] == 0, "and its time is kept for the next run"
 
 
@@ -232,3 +246,218 @@ async def test_a_first_rebuild_says_how_long_it_has_taken_so_far(tmp_path: Path,
     database.job["status_detail"] = "Opening DVD disc"
     await asyncio.sleep(0.05)
     assert database.job["status_detail"] == "Opening DVD disc"
+
+
+@pytest.mark.asyncio
+async def test_working_around_the_drives_region_is_shown_while_makemkv_is_silent(tmp_path: Path) -> None:
+    from test_workflow_recovery import make_job, make_service
+
+    settings = AppSettings(data_root=tmp_path)
+    service, database = make_service(settings, make_job(settings, tmp_path / "staging"))
+    database.job["status_detail"] = "Decrypting data"
+    region = (
+        'MSG:3032,0,2,"Region setting of drive BD-RE HL-DT-ST BD-RE BU40N 1.05:2 does not match the region of '
+        'currently inserted disc, trying to work around..."'
+    )
+
+    await service._process_event("job-id", {"type": "msg", "message": region})
+
+    assert database.job["status_detail"] == (
+        "MakeMKV says the drive's region does not match the disc and is working around it"
+    )
+
+
+REGION_STALL = ProcessResult(
+    args=[],
+    return_code=-1,
+    timed_out=True,
+    lines=[
+        (
+            'MSG:3032,0,2,"Regionsinnstilling for stasjon HL-DT-ST:BD-RE BU40N passer ikke med regionen for den '
+            'innsatte platen, forsøker å løse dette..."'
+        )
+    ]
+    * 10,
+)
+
+
+@pytest.mark.asyncio
+async def test_a_scan_that_stalls_after_a_region_message_is_made_again(tmp_path: Path) -> None:
+    # SPEKTRALSTEINENE: ten region messages just after the disc went in, then silence until
+    # the scan was stopped. Scanned again by hand, it listed its titles in under a minute.
+    service, _, drive, settings, calls = _service(tmp_path, [])
+    outcomes: list[DiscScan | ProcessFailure] = [
+        ProcessFailure("MakeMKV inspection timed out", REGION_STALL),
+        DiscScan(title_count=1, titles=[_film()]),
+    ]
+
+    class Scanner:
+        async def inspect(self, *_args, **_kwargs):
+            calls.append(1)
+            outcome = outcomes[len(calls) - 1]
+            if isinstance(outcome, ProcessFailure):
+                raise outcome
+            return outcome
+
+    service._make_mkv = lambda _settings=None: Scanner()  # type: ignore[method-assign]
+
+    scan = await service._inspect_disc("job-1", drive, settings)
+
+    assert len(calls) == 2 and scan.titles[0].duration_seconds == 6220
+
+
+@pytest.mark.asyncio
+async def test_a_region_stall_is_scanned_again_only_once(tmp_path: Path) -> None:
+    service, _, drive, settings, calls = _service(tmp_path, [])
+
+    class Scanner:
+        async def inspect(self, *_args, **_kwargs):
+            calls.append(1)
+            raise ProcessFailure("MakeMKV inspection timed out", REGION_STALL)
+
+    service._make_mkv = lambda _settings=None: Scanner()  # type: ignore[method-assign]
+
+    with pytest.raises(ProcessFailure, match="timed out"):
+        await service._inspect_disc("job-1", drive, settings)
+    assert len(calls) == 2
+
+
+
+DENVER_SKIPPED = [
+    (
+        'MSG:3015,0,2,"Title #2/2 (0:39:54) was skipped due to navigation error","Title #%1 (%2) was skipped due '
+        'to navigation error","2/2","0:39:54"'
+    ),
+    'MSG:3028,0,3,"Title #2/3 was added (3 cell(s), 0:17:15)"',
+]
+
+
+def _denver_scan() -> DiscScan:
+    return DiscScan(
+        title_count=1,
+        titles=[TitleInfo(id=0, disc_title_number=2, duration_seconds=1035, size_bytes=659_100_000, chapters=1)],
+        raw_lines=DENVER_SKIPPED,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_film_makemkv_keeps_leaving_out_is_taken_from_the_discs_own_tables(tmp_path: Path, monkeypatch) -> None:
+    # Denver, the Last Dinosaur: three scans leave out the 39:54 title, while the disc's
+    # navigation says its title 2 plays for 41:19.
+    service, database, drive, settings, calls = _service(tmp_path, [_denver_scan()])
+    monkeypatch.setattr(
+        workflow_module, "dvd_titles_in_folder", lambda folder: [DvdTitle(1, 1, 0, 3), DvdTitle(2, 2, 2479, 10)]
+    )
+    monkeypatch.setattr(workflow_module, "dvd_folder_video_scrambled", lambda folder, title_set: False)
+    tables = DiscScan(title_count=1, titles=[TitleInfo(id=0, disc_title_number=2, duration_seconds=2479, chapters=10)])
+    handed: list[bool] = []
+
+    async def rescued(job_id, _drive, _settings):
+        handed.append(bool((database.get_job(job_id) or {})["metadata"].get("titles_from_tables")))
+        return tables
+
+    service._scan_rescued_structures = rescued  # type: ignore[method-assign]
+
+    scan = await service._inspect_disc("job-1", drive, settings)
+
+    assert scan is tables and len(calls) == 3
+    assert handed == [True], "the rescue lists the titles from the disc's tables, not from MakeMKV"
+    assert "feature_skipped_seconds" not in (database.get_job("job-1") or {})["metadata"]
+
+
+@pytest.mark.asyncio
+async def test_when_the_tables_have_nothing_that_long_the_choice_stays_yours(tmp_path: Path, monkeypatch) -> None:
+    service, database, drive, settings, _ = _service(tmp_path, [_denver_scan()])
+    monkeypatch.setattr(workflow_module, "dvd_titles_in_folder", lambda folder: [DvdTitle(2, 2, 1035, 3)])
+
+    async def rescued(*_args):
+        raise AssertionError("nothing in the tables is the film")
+
+    service._scan_rescued_structures = rescued  # type: ignore[method-assign]
+
+    scan = await service._inspect_disc("job-1", drive, settings)
+
+    assert scan.titles[0].duration_seconds == 1035
+    assert (database.get_job("job-1") or {})["metadata"]["feature_skipped_seconds"] == 2394
+
+
+
+@pytest.mark.asyncio
+async def test_a_copy_protected_disc_keeps_the_choice_since_only_makemkv_decrypts(tmp_path: Path, monkeypatch) -> None:
+    service, database, drive, settings, _ = _service(tmp_path, [_denver_scan()])
+    monkeypatch.setattr(workflow_module, "dvd_titles_in_folder", lambda folder: [DvdTitle(2, 2, 2479, 10)])
+    monkeypatch.setattr(workflow_module, "dvd_folder_video_scrambled", lambda folder, title_set: True)
+
+    async def rescued(*_args):
+        raise AssertionError("FFmpeg cannot copy scrambled video, so the rescue would end with nothing")
+
+    service._scan_rescued_structures = rescued  # type: ignore[method-assign]
+
+    await service._inspect_disc("job-1", drive, settings)
+
+    assert (database.get_job("job-1") or {})["metadata"]["feature_skipped_seconds"] == 2394
+
+
+class _Ripper:
+    """MakeMKV ripping: each run either loses the film or saves it, in the order given."""
+
+    def __init__(self, outcomes: list[str]) -> None:
+        self.outcomes = outcomes
+        self.runs = 0
+
+    async def rip(self, job_id, letter, destination, title_ids, timeout, callback=None, backup=False, min_length=None):
+        from discdock.processes import ProcessFailure, ProcessResult
+
+        outcome = self.outcomes[min(self.runs, len(self.outcomes) - 1)]
+        self.runs += 1
+        if outcome == "lost":
+            # The Karate Kid Part II: the rip's second look skipped the film, then MakeMKV gave up.
+            lines = [
+                'MSG:3024,16781312,2,"Complex multiplex encountered - 2 cells and 1170 VOBUs have to be scanned."',
+                'MSG:3015,0,2,"Title #1 (1:48:37) was skipped due to navigation error"',
+                'MSG:5010,0,0,"Failed to open disc"',
+            ]
+            raise ProcessFailure("MakeMKV ripping failed", ProcessResult(["makemkvcon64"], 1, lines))
+        if outcome == "cancelled":
+            raise ProcessFailure("MakeMKV ripping failed", ProcessResult(["makemkvcon64"], 1, [], cancelled=True))
+        destination.mkdir(parents=True, exist_ok=True)
+        (destination / "title_t00.mkv").write_bytes(b"x" * 1024)
+        return [ProcessResult(["makemkvcon64"], 0)]
+
+
+async def _rip(tmp_path: Path, outcomes: list[str]):
+    service, database, drive, settings, _ = _service(tmp_path, [DiscScan()])
+    settings.ffprobe_path = ""
+    ripper = _Ripper(outcomes)
+    service._make_mkv = lambda _settings=None: ripper  # type: ignore[method-assign]
+    staging = tmp_path / "raw" / "job-1.partial"
+    tracks = [{"source_id": 0, "duration_seconds": 6503, "selected": True}]
+    job = database.get_job("job-1") or {}
+    await service._rip_with_makemkv("job-1", drive, settings, staging, tracks, [0], job)
+    return ripper, staging
+
+
+@pytest.mark.asyncio
+async def test_a_rip_that_lost_the_film_is_run_again(tmp_path: Path) -> None:
+    ripper, staging = await _rip(tmp_path, ["lost", "saved"])
+
+    assert ripper.runs == 2 and (staging / "title_t00.mkv").is_file()
+    log = (tmp_path / "logs" / "job-1.log").read_text(encoding="utf-8")
+    assert 'left out the 1:48:37 title "due to navigation error" when it looked at the disc again' in log
+
+
+@pytest.mark.asyncio
+async def test_a_rip_that_keeps_losing_the_film_fails_after_three_runs(tmp_path: Path) -> None:
+    from discdock.processes import ProcessFailure
+
+    with pytest.raises(ProcessFailure, match="ripping failed"):
+        await _rip(tmp_path, ["lost"])
+
+
+@pytest.mark.asyncio
+async def test_a_stopped_rip_is_not_run_again(tmp_path: Path) -> None:
+    from discdock.processes import ProcessFailure
+
+    # Cancelled, for example to switch to the damaged-disc rescue: that is not MakeMKV losing the film.
+    with pytest.raises(ProcessFailure):
+        await _rip(tmp_path, ["cancelled", "saved"])

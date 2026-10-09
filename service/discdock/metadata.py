@@ -63,12 +63,13 @@ EXACT, SEQUEL, CLOSE, PARTIAL, UNRELATED = range(5)
 
 def _label_words(label: str) -> list[str]:
     text = HASH_SUFFIX.sub("", label.strip())
-    text = re.sub(r"[_.<>\[\]{}#|*]+", " ", text)
+    # Brackets only set an edition apart: "The Karate Kid (Special Edition)".
+    text = re.sub(r"[_.<>()\[\]{}#|*]+", " ", text)
     return [word for word in text.split() if any(character.isalnum() for character in word)]
 
 
 def _is_noise(word: str) -> bool:
-    lowered = word.casefold().strip(",")
+    lowered = word.casefold().strip(",:").replace("-", "")
     return lowered in NOISE_WORDS or bool(NOISE_TOKEN.fullmatch(lowered))
 
 
@@ -112,7 +113,7 @@ def title_from_label(label: str) -> tuple[str, str]:
     for word in words:
         attached = ATTACHED_NUMBER.match(word)
         split.extend(attached.groups() if attached else [word])
-    title = " ".join(word for word in split if word not in {"-", ","}).strip(" -,")
+    title = " ".join(word for word in split if word not in {"-", ","}).strip(" -,:")
     # Labels in capitals get ordinary capitals; a name the disc wrote itself keeps its own.
     if title == title.upper():
         title = title.title()

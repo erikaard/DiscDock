@@ -32,7 +32,11 @@ PAGE_READWRITE = 0x04
 FILE_BEGIN = 0
 IOCTL_SCSI_PASS_THROUGH_DIRECT = 0x0004D014
 IOCTL_DISK_GET_LENGTH_INFO = 0x0007405C
+SCSI_IOCTL_DATA_OUT = 0
 SCSI_IOCTL_DATA_IN = 1
+SCSI_IOCTL_DATA_UNSPECIFIED = 2
+# A CD's 1x, 176 KB/s: asked for this, a drive reads as slowly as it can, whatever the disc.
+SLOWEST_READ_KBPS = 176
 
 ERROR_ACCESS_DENIED = 5
 ERROR_INVALID_FUNCTION = 1
@@ -240,6 +244,14 @@ class OpticalDevice:
     def reopen(self) -> None:
         return None
 
+    def set_read_speed(self, kilobytes_per_second: int | None) -> bool:
+        """Ask the drive to read at about this speed, or at its own full speed with None.
+
+        Returns whether the drive accepted it; a reader that cannot ask leaves the speed alone.
+        """
+        _ = kilobytes_per_second
+        return False
+
     def __enter__(self) -> Self:
         return self
 
@@ -301,19 +313,31 @@ class SptiDevice(OpticalDevice):
         if buffer:
             buffer.close()
 
-    def _command(self, cdb: bytes, length: int, timeout: int | None = None) -> tuple[int, bytes, int]:
-        """Run one data-in command. Returns (SCSI status, sense bytes, transferred)."""
+    def _command(
+        self, cdb: bytes, length: int, timeout: int | None = None, data: bytes | None = None
+    ) -> tuple[int, bytes, int]:
+        """Run one command: reading ``length`` bytes, sending ``data``, or neither.
+
+        Returns (SCSI status, sense bytes, transferred).
+        """
         from ctypes import wintypes
 
         if not self._handle:
             self._open()
+        if data is not None:
+            length = len(data)
         if length > self._buffer.size:
             raise ValueError("SCSI transfer exceeds the aligned buffer")
+        if data is not None:
+            ctypes.memmove(self._buffer.address, data, length)
+            direction = SCSI_IOCTL_DATA_OUT
+        else:
+            direction = SCSI_IOCTL_DATA_IN if length else SCSI_IOCTL_DATA_UNSPECIFIED
         request = _ScsiPassThroughDirectWithSense()
         request.sptd.Length = ctypes.sizeof(_ScsiPassThroughDirect)
         request.sptd.CdbLength = len(cdb)
         request.sptd.SenseInfoLength = len(request.Sense)
-        request.sptd.DataIn = SCSI_IOCTL_DATA_IN
+        request.sptd.DataIn = direction
         request.sptd.DataTransferLength = length
         request.sptd.TimeOutValue = int(timeout or self.timeout_seconds)
         request.sptd.DataBuffer = self._buffer.address if length else None
@@ -335,6 +359,16 @@ class SptiDevice(OpticalDevice):
             error = ctypes.get_last_error()
             raise ctypes.WinError(error)
         return request.sptd.ScsiStatus, bytes(request.Sense), int(request.sptd.DataTransferLength)
+
+    def set_read_speed(self, kilobytes_per_second: int | None) -> bool:
+        accepted = False
+        for cdb, data in speed_commands(self.total_sectors, kilobytes_per_second):
+            try:
+                status, _sense, _transferred = self._command(cdb, 0, timeout=10, data=data)
+            except OSError:
+                continue
+            accepted = accepted or status == 0
+        return accepted
 
     def _read_capacity(self) -> int:
         cdb = bytes([0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0])
@@ -451,6 +485,25 @@ class SptiDevice(OpticalDevice):
             position += take
             remaining -= take
         return bytes(output)
+
+
+def speed_commands(total_sectors: int, kilobytes_per_second: int | None) -> list[tuple[bytes, bytes | None]]:
+    """The commands that set a drive's read speed: SET STREAMING, which DVD and Blu-ray drives
+    follow, and SET CD SPEED, which older drives do. Drives round to a speed they support."""
+    descriptor = bytearray(28)
+    if kilobytes_per_second is None:
+        descriptor[0] = 0x04  # RDD: back to the drive's own choice
+        speed = 0xFFFF
+    else:
+        speed = max(1, min(0xFFFE, int(kilobytes_per_second)))
+        descriptor[8:12] = max(0, total_sectors - 1).to_bytes(4, "big")
+        # So many kilobytes each second, reading and writing alike.
+        for offset in (12, 20):
+            descriptor[offset : offset + 4] = speed.to_bytes(4, "big")
+            descriptor[offset + 4 : offset + 8] = (1000).to_bytes(4, "big")
+    streaming = bytes([0xB6, 0, 0, 0, 0, 0, 0, 0, 0, 0, len(descriptor), 0])
+    cd_speed = bytes([0xBB, 0, speed >> 8, speed & 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0])
+    return [(streaming, bytes(descriptor)), (cd_speed, None)]
 
 
 class _TransferTooLarge(Exception):
@@ -894,6 +947,21 @@ def dvd_video_scrambled(read: ReadSectors, ranges: list[tuple[int, int]], sample
     return False
 
 
+def dvd_folder_video_scrambled(folder: Path, title_set: int) -> bool:
+    """Whether a title set's video in a VIDEO_TS folder is CSS-scrambled; video that cannot be read counts as such."""
+    try:
+        with (folder / f"VTS_{title_set:02d}_1.VOB").open("rb") as handle:
+            sectors = os.fstat(handle.fileno()).st_size // SECTOR_SIZE
+
+            def read(lba: int, count: int) -> bytes:
+                handle.seek(lba * SECTOR_SIZE)
+                return handle.read(count * SECTOR_SIZE)
+
+            return sectors == 0 or dvd_video_scrambled(read, [(0, sectors)])
+    except OSError:
+        return True
+
+
 def read_dvd_layout(
     read: ReadSectors,
     total_sectors: int,
@@ -1005,35 +1073,42 @@ def dvd_titles(read: ReadSectors, files: dict[str, DiscFile]) -> list[DvdTitle]:
         ptt, pgci = _be32(data, 0xC8) * SECTOR_SIZE, _be32(data, 0xCC) * SECTOR_SIZE
         if data[:12] != b"DVDVIDEO-VTS" or not ptt or not pgci or not 1 <= vts_title <= _be16(data, ptt):
             continue
-        program_chain = _be16(data, ptt + _be32(data, ptt + 8 + 4 * (vts_title - 1)))
-        if not 1 <= program_chain <= _be16(data, pgci):
+        chapter_table = ptt + _be32(data, ptt + 8 + 4 * (vts_title - 1))
+        lengths = [
+            _chain_seconds(data, pgci, _be16(data, chapter_table + 4 * chapter))
+            for chapter in range(max(1, chapters))
+            if chapter_table + 4 * chapter + 2 <= len(data)
+        ]
+        if not lengths or lengths[0] is None:
             continue
-        pgc = pgci + _be32(data, pgci + 8 + 8 * (program_chain - 1) + 4)
-        if pgc + 8 > len(data):
-            continue
-        hours, minutes, seconds = (
-            int(f"{value:02x}") if (value >> 4) < 10 and (value & 15) < 10 else 0
-            for value in data[pgc + 4 : pgc + 7]
-        )
-        titles.append(DvdTitle(number, title_set, hours * 3600 + minutes * 60 + seconds, max(1, chapters)))
+        # The first chapter normally starts the title's program chain. On some discs it is a
+        # chain of jump commands with no video (Denver, the Last Dinosaur); the title then
+        # plays as long as the longest chain its chapters lead to.
+        seconds = lengths[0] or max((length or 0 for length in lengths), default=0)
+        titles.append(DvdTitle(number, title_set, seconds, max(1, chapters)))
     return titles
 
 
-def dvd_title_contents(folder: Path) -> dict[int, tuple[int, list[tuple[int, int]]]]:
-    """What each DVD title plays, from the IFO files of a VIDEO_TS folder.
+def _chain_seconds(data: bytes, pgci: int, number: int) -> int | None:
+    """The playback time a title set's program chain declares, or None when there is no such chain."""
+    if not 1 <= number <= _be16(data, pgci) or pgci + 16 + 8 * number > len(data):
+        return None
+    pgc = pgci + _be32(data, pgci + 8 + 8 * (number - 1) + 4)
+    if pgc + 8 > len(data):
+        return None
+    hours, minutes, seconds = (
+        int(f"{value:02x}") if (value >> 4) < 10 and (value & 15) < 10 else 0 for value in data[pgc + 4 : pgc + 7]
+    )
+    return hours * 3600 + minutes * 60 + seconds
 
-    Maps the disc's title number to its title set and the sector ranges of its cells,
-    counted from the start of that title set's video. Titles that play the same sectors
-    are one video, whatever MakeMKV calls them (Disney discs list a film once per
-    credits language); titles that share no sectors are different episodes, however
-    alike their lengths. Empty when the folder cannot be read.
-    """
+
+def _ifo_folder(folder: Path) -> tuple[ReadSectors, dict[str, DiscFile]] | None:
+    """A VIDEO_TS folder's IFO files, laid out one after another as the disc parsers expect."""
     names = ["VIDEO_TS.IFO"]
     try:
         names += sorted({path.name.upper() for path in folder.glob("VTS_*_0.IFO")})
     except OSError:
-        return {}
-    # The parsers read sectors of a disc, so the IFO files are laid out one after another.
+        return None
     disc = bytearray()
     files: dict[str, DiscFile] = {}
     for name in names:
@@ -1041,7 +1116,7 @@ def dvd_title_contents(folder: Path) -> dict[int, tuple[int, list[tuple[int, int
             data = (folder / name).read_bytes()
         except OSError:
             if name == "VIDEO_TS.IFO":
-                return {}
+                return None
             continue
         if len(data) > 4096 * SECTOR_SIZE:
             continue
@@ -1054,6 +1129,33 @@ def dvd_title_contents(folder: Path) -> dict[int, tuple[int, list[tuple[int, int
     def read(lba: int, count: int) -> bytes:
         return bytes(disc[lba * SECTOR_SIZE : (lba + count) * SECTOR_SIZE]).ljust(count * SECTOR_SIZE, b"\0")
 
+    return read, files
+
+
+def dvd_titles_in_folder(folder: Path) -> list[DvdTitle]:
+    """Every title a VIDEO_TS folder's navigation lists, with its playback time; empty when unreadable."""
+    found = _ifo_folder(folder)
+    if found is None:
+        return []
+    try:
+        return dvd_titles(*found)
+    except (OpticalError, ValueError, IndexError):
+        return []
+
+
+def dvd_title_contents(folder: Path) -> dict[int, tuple[int, list[tuple[int, int]]]]:
+    """What each DVD title plays, from the IFO files of a VIDEO_TS folder.
+
+    Maps the disc's title number to its title set and the sector ranges of its cells,
+    counted from the start of that title set's video. Titles that play the same sectors
+    are one video, whatever MakeMKV calls them (Disney discs list a film once per
+    credits language); titles that share no sectors are different episodes, however
+    alike their lengths. Empty when the folder cannot be read.
+    """
+    found = _ifo_folder(folder)
+    if found is None:
+        return {}
+    read, files = found
     contents: dict[int, tuple[int, list[tuple[int, int]]]] = {}
     try:
         header = read(0, 1)

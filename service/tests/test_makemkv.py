@@ -10,6 +10,7 @@ from discdock.makemkv import (
     MakeMKVLicenseError,
     MakeMKVParser,
     NoVideoTitles,
+    corrupt_spot,
     has_license_prompt,
     parse_duration,
     parse_robot_line,
@@ -205,3 +206,20 @@ def test_the_disc_name_is_the_one_makemkv_reads_from_the_disc() -> None:
     labelled = MakeMKVParser("D:")
     labelled.accept('DRV:0,2,999,1,"Drive","FROZEN","D:"')
     assert labelled.finish().disc_name == "FROZEN", "the label still serves when the disc names nothing"
+
+
+def test_a_corrupt_spot_is_found_in_whatever_language_makemkv_speaks() -> None:
+    norwegian = (
+        "MSG:4004,16777216,2,\"Kildefilen '/BDMV/STREAM/00800.m2ts' er skadet eller ugyldig ved offset 12288, "
+        "forsøker å løse dette\",\"Kildefilen '%1' er skadet eller ugyldig ved offset %2, forsøker å løse dette\","
+        "\"/BDMV/STREAM/00800.m2ts\",\"12288\""
+    )
+    english = (
+        "MSG:4004,16777216,2,\"The source file '/BDMV/STREAM/00800.m2ts' is corrupt or invalid at offset 12288, "
+        "attempting to work around\""
+    )
+
+    assert corrupt_spot(norwegian) == ("/BDMV/STREAM/00800.m2ts", "12288")
+    assert corrupt_spot(english) == ("/BDMV/STREAM/00800.m2ts", "12288"), "a line without its values still counts"
+    assert corrupt_spot('MSG:3028,0,3,"Title #1 was added (81 cell(s), 3:50:59)"') is None
+    assert corrupt_spot("Saving to MKV file") is None

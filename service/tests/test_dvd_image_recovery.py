@@ -151,6 +151,17 @@ def test_scrambled_video_is_recognised_so_it_is_not_copied_as_noise() -> None:
     assert dvd_video_scrambled(reader(clear), []) is False
 
 
+def test_a_title_sets_video_is_checked_for_scrambling_in_the_drives_folder(tmp_path: Path) -> None:
+    from discdock.optical import dvd_folder_video_scrambled
+
+    (tmp_path / "VTS_02_1.VOB").write_bytes(_pack(0xE0, 0) * 64)
+    (tmp_path / "VTS_03_1.VOB").write_bytes(_pack(0xE0, 1) * 64)
+
+    assert dvd_folder_video_scrambled(tmp_path, 2) is False
+    assert dvd_folder_video_scrambled(tmp_path, 3) is True
+    assert dvd_folder_video_scrambled(tmp_path, 4) is True, "unreadable video counts as scrambled"
+
+
 def test_the_discs_own_tables_list_the_titles_makemkv_refuses() -> None:
     from test_disc_rescue import _dvd_reader, _vts_ifo
 
@@ -185,3 +196,165 @@ def test_a_rescued_image_can_be_scanned_without_makemkv(tmp_path: Path) -> None:
     assert DiscDockService._titles_from_disc_tables(tmp_path / "missing.iso") is None
     (tmp_path / "not-a-disc.iso").write_bytes(b"\0" * (64 * SECTOR_SIZE))
     assert DiscDockService._titles_from_disc_tables(tmp_path / "not-a-disc.iso") is None
+
+
+def _menu_led_vts_ifo() -> bytes:
+    """Denver, the Last Dinosaur: chapter 1 is a chain of jump commands with no video, which
+    MakeMKV and libdvdnav both reject; the others start the 41:19 play-all chain or one
+    that skips the 84-second intro."""
+    data = bytearray(4 * SECTOR_SIZE)
+    data[:12] = b"DVDVIDEO-VTS"
+    data[0xC8:0xCC] = (1).to_bytes(4, "big")
+    data[0xCC:0xD0] = (2).to_bytes(4, "big")
+    ptt = SECTOR_SIZE
+    data[ptt : ptt + 2] = (1).to_bytes(2, "big")
+    data[ptt + 8 : ptt + 12] = (12).to_bytes(4, "big")
+    for chapter, (chain, program) in enumerate([(1, 0), (2, 1), (3, 1)]):
+        at = ptt + 12 + 4 * chapter
+        data[at : at + 2] = chain.to_bytes(2, "big")
+        data[at + 2 : at + 4] = program.to_bytes(2, "big")
+    pgci = 2 * SECTOR_SIZE
+    data[pgci : pgci + 2] = (3).to_bytes(2, "big")
+    for index, (cells, seconds) in enumerate([([], 0), ([(0, 49), (50, 199)], 2479), ([(50, 199)], 2394)]):
+        offset = 0x40 + 0x200 * index
+        data[pgci + 12 + 8 * index : pgci + 16 + 8 * index] = offset.to_bytes(4, "big")
+        pgc = pgci + offset
+        data[pgc + 3] = len(cells)
+        hours, rest = divmod(seconds, 3600)
+        minutes, remainder = divmod(rest, 60)
+        for position, value in enumerate((hours, minutes, remainder)):
+            data[pgc + 4 + position] = int(f"{value:02d}", 16)
+        data[pgc + 0xE8 : pgc + 0xEA] = (0xEC).to_bytes(2, "big")
+        for cell, (first, last) in enumerate(cells):
+            entry = pgc + 0xEC + 24 * cell
+            data[entry + 8 : entry + 12] = first.to_bytes(4, "big")
+            data[entry + 20 : entry + 24] = last.to_bytes(4, "big")
+    return bytes(data)
+
+
+def test_a_title_that_starts_with_jumps_plays_as_long_as_its_longest_chain(tmp_path: Path) -> None:
+    from test_disc_rescue import _dvd_reader
+
+    from discdock.optical import DvdTitle, dvd_titles, read_video_ts_files
+    from discdock.workflow import DiscDockService
+
+    read, total = _dvd_reader(vts_ifo=_menu_led_vts_ifo(), vts_title=1, chapters=3)
+
+    assert dvd_titles(read, read_video_ts_files(read, total)) == [
+        DvdTitle(number=2, title_set=1, duration_seconds=2479, chapters=3)
+    ]
+    image = tmp_path / "rescued-disc.iso"
+    image.write_bytes(read(0, total))
+    scan = DiscDockService._titles_from_disc_tables(image)
+    assert scan is not None and len(scan.titles) == 1
+    assert (scan.titles[0].duration_seconds, scan.titles[0].size_bytes) == (2479, 200 * SECTOR_SIZE)
+
+
+def test_the_tables_are_read_from_the_drives_video_ts_folder(tmp_path: Path) -> None:
+    from test_disc_rescue import _dvd_reader
+
+    from discdock.optical import DvdTitle, dvd_titles_in_folder
+
+    read, _ = _dvd_reader(vts_ifo=_menu_led_vts_ifo(), vts_title=1, chapters=3)
+    folder = tmp_path / "VIDEO_TS"
+    folder.mkdir()
+    (folder / "VIDEO_TS.IFO").write_bytes(read(600, 2))
+    (folder / "VTS_01_0.IFO").write_bytes(read(602, 4))
+
+    assert dvd_titles_in_folder(folder) == [DvdTitle(number=2, title_set=1, duration_seconds=2479, chapters=3)]
+    assert dvd_titles_in_folder(tmp_path / "missing") == []
+
+
+def _denver_service(tmp_path: Path):
+    from test_workflow_recovery import make_job, make_service
+
+    from discdock.models import DiscKind, DriveInfo
+    from discdock.settings import AppSettings
+
+    settings = AppSettings(data_root=tmp_path)
+    service, database = make_service(settings, make_job(settings, tmp_path / "staging"))
+    database.job["metadata"] = {"titles_from_tables": True}
+    drive = DriveInfo(
+        id="drive-id", letter="D:", name="Reader", media_loaded=True, volume_label="DENVER", disc_kind=DiscKind.DVD
+    )
+    return service, database, drive, settings
+
+
+@pytest.mark.asyncio
+async def test_titles_from_the_discs_tables_skip_makemkvs_look_at_the_rescued_copy(tmp_path: Path, monkeypatch) -> None:
+    from discdock.makemkv import DiscScan
+    from discdock.models import TitleInfo
+    from discdock.workflow import DiscDockService
+
+    service, _, drive, settings = _denver_service(tmp_path)
+    read_structures: list[bool] = []
+
+    async def rescue(*_args, **kwargs):
+        read_structures.append(bool(kwargs.get("structures_only")))
+        return {}
+
+    async def makemkv_scan(*_args):
+        raise AssertionError("MakeMKV cannot see this title in a copy of the disc either")
+
+    tables = DiscScan(title_count=1, titles=[TitleInfo(id=0, disc_title_number=2, duration_seconds=2479)])
+    service._run_sector_rescue = rescue  # type: ignore[method-assign]
+    service._scan_image = makemkv_scan  # type: ignore[method-assign]
+    monkeypatch.setattr(DiscDockService, "_titles_from_disc_tables", staticmethod(lambda path: tables))
+
+    assert await service._scan_rescued_structures("job-id", drive, settings) is tables
+    assert read_structures == [True]
+
+
+@pytest.mark.asyncio
+async def test_such_a_title_is_copied_out_without_makemkv(tmp_path: Path) -> None:
+    service, _, _, settings = _denver_service(tmp_path)
+    staging = tmp_path / "staging"
+    staging.mkdir(parents=True, exist_ok=True)
+    used: list[str] = []
+
+    async def makemkv(*_args, **_kwargs):
+        used.append("makemkv")
+        return False
+
+    async def ffmpeg(job_id, _settings, image, extracted, main_track, *_args):
+        used.append("ffmpeg")
+        extracted.mkdir(parents=True, exist_ok=True)
+        (extracted / "recovered.mkv").write_bytes(b"x")
+        return True
+
+    service._extract_image_with_makemkv = makemkv  # type: ignore[method-assign]
+    service._extract_image_with_mended_copy = makemkv  # type: ignore[method-assign]
+    service._extract_image_with_ffmpeg = ffmpeg  # type: ignore[method-assign]
+
+    await service._extract_title_from_image(
+        "job-id", "D:", settings, tmp_path / "rescued-disc.iso", staging, {"disc_title_number": 2}
+    )
+
+    assert used == ["ffmpeg"] and (staging / "recovered.mkv").is_file()
+
+
+@pytest.mark.asyncio
+async def test_makemkv_is_not_trusted_with_a_title_far_shorter_than_the_one_chosen(tmp_path: Path) -> None:
+    from discdock.makemkv import DiscScan
+    from discdock.models import TitleInfo
+
+    service, _, _, settings = _denver_service(tmp_path)
+
+    class Client:
+        async def inspect_source(self, *_args, **_kwargs):
+            return DiscScan(titles=[TitleInfo(id=0, disc_title_number=2, duration_seconds=1035)])
+
+        async def rip_source(self, *_args, **_kwargs):
+            raise AssertionError("the 17 minutes MakeMKV can see are not the 41 chosen")
+
+    async def event(_event: dict) -> None:
+        return None
+
+    problems: list[str] = []
+    finished = await service._extract_image_with_makemkv(
+        "job-id", "D:", settings, tmp_path / "rescued-disc.iso", tmp_path / "extracted",
+        {"disc_title_number": 2, "duration_seconds": 2479}, Client(), "iso:rescued-disc.iso", 120,
+        [], {}, event, event, problems, is_dvd=True, last=False,
+    )
+
+    assert finished is False and "17:15" in problems[0] and "41:19" in problems[0]
