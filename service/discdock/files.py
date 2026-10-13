@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import unicodedata
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
 from .damage_screens import UNREPAIRED_SUFFIXES, is_unrepaired_copy
@@ -64,6 +65,24 @@ def ensure_within(path: Path, root: Path) -> Path:
     return resolved
 
 
+def library_folder(
+    completed: Path, media_kind: MediaKind, title: str, year: str, *, include_category: bool = True
+) -> Path:
+    """The folder a title is filed under in the library, such as ``tv/Desperate Housewives (2004)``."""
+    category = {
+        MediaKind.MOVIE: "movies",
+        MediaKind.SERIES: "tv",
+        MediaKind.MUSIC: "music",
+        MediaKind.OTHER: "other",
+        MediaKind.DATA: "data",
+    }.get(media_kind, "unidentified")
+    name = safe_component(title)
+    if year and year[:4].isdigit():
+        name = f"{name} ({year[:4]})"
+    parent = completed / category if include_category else completed
+    return ensure_within(parent / name, completed)
+
+
 def output_folder(
     completed: Path,
     media_kind: MediaKind,
@@ -76,18 +95,7 @@ def output_folder(
 ) -> Path:
     if duplicate_policy not in {"replace", "keep_both"}:
         raise ValueError("Output creation requires replace or keep_both duplicate handling")
-    category = {
-        MediaKind.MOVIE: "movies",
-        MediaKind.SERIES: "tv",
-        MediaKind.MUSIC: "music",
-        MediaKind.OTHER: "other",
-        MediaKind.DATA: "data",
-    }.get(media_kind, "unidentified")
-    name = safe_component(title)
-    if year and year[:4].isdigit():
-        name = f"{name} ({year[:4]})"
-    parent = completed / category if include_category else completed
-    canonical = ensure_within(parent / name, completed)
+    canonical = library_folder(completed, media_kind, title, year, include_category=include_category)
     if duplicate_policy == "replace" or not canonical.exists():
         return canonical
 
@@ -113,14 +121,74 @@ def _next_number(folder: Path | None, base: str, label: str) -> int:
     return highest + 1
 
 
+# "Season 01", "Season 2": a series' season folders, as media servers name them.
+SEASON_FOLDER = re.compile(r"^season\s+(\d{1,3})$", re.IGNORECASE)
+# "Desperate Housewives (2004) - S01E17" in a season folder, "... - Episode 17" without one.
+SEASON_EPISODE = re.compile(r"\bS(\d{1,3})E(\d{1,4})$", re.IGNORECASE)
+LOOSE_EPISODE = re.compile(r"\bEpisode (\d{1,4})$", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class SeriesSeason:
+    """A place in a series' library folder that episodes can be added to."""
+
+    # None for episodes lying loose in the series folder itself.
+    number: int | None
+    folder: Path
+    episodes: int
+    next_episode: int
+
+
+def season_folder(series: Path, season: int) -> Path:
+    return series / f"Season {season:02d}"
+
+
+def episode_numbers(folder: Path | None, season: int | None = None) -> list[int]:
+    """The episode numbers of the MKV files in ``folder``: of ``season``, or the unnumbered "Episode NN" ones."""
+    if folder is None or not folder.is_dir():
+        return []
+    numbers: list[int] = []
+    for path in folder.glob("*.mkv"):
+        named = SEASON_EPISODE.search(path.stem)
+        if named and season is not None and int(named.group(1)) == season:
+            numbers.append(int(named.group(2)))
+        elif not named and (loose := LOOSE_EPISODE.search(path.stem)):
+            numbers.append(int(loose.group(1)))
+    return numbers
+
+
+def series_seasons(series: Path) -> list[SeriesSeason]:
+    """The season folders of a series in the library, and the series folder itself when episodes lie loose in it."""
+    if not series.is_dir():
+        return []
+    seasons: list[SeriesSeason] = []
+    for child in series.iterdir():
+        found = SEASON_FOLDER.match(child.name)
+        if found and child.is_dir():
+            number = int(found.group(1))
+            numbers = episode_numbers(child, number)
+            seasons.append(SeriesSeason(number, child, len(numbers), max(numbers, default=0) + 1))
+    seasons.sort(key=lambda season: season.number or 0)
+    loose = episode_numbers(series)
+    if loose:
+        seasons.append(SeriesSeason(None, series, len(loose), max(loose) + 1))
+    return seasons
+
+
 def rename_video_outputs(
-    folder: Path, folder_name: str, media_kind: MediaKind, *, existing: Path | None = None
+    folder: Path,
+    folder_name: str,
+    media_kind: MediaKind,
+    *,
+    existing: Path | None = None,
+    season: int | None = None,
 ) -> list[Path]:
     """Give MKV files stable library names before the staging tree is finalized.
 
     With ``existing``, the files join a library folder that already holds some:
     episode and extra numbers continue after the ones there, and a folder that
-    already has its movie gets only extras.
+    already has its movie gets only extras. Episodes of a ``season`` are named
+    "<series> - S01E05" and numbered on from that season's folder.
     """
     everything = [path for path in folder.rglob("*") if path.is_file() and path.suffix.lower() == ".mkv"]
     # The copy kept without loading screens or AI frames follows the movie's name.
@@ -129,7 +197,11 @@ def rename_video_outputs(
     if not files:
         return []
     base = safe_component(folder_name)
-    if media_kind == MediaKind.SERIES:
+    if media_kind == MediaKind.SERIES and season:
+        ordered = sorted(files, key=lambda path: path.name.casefold())
+        first = max(episode_numbers(existing, season), default=0) + 1
+        names = [f"{base} - S{season:02d}E{index:02d}.mkv" for index in range(first, first + len(ordered))]
+    elif media_kind == MediaKind.SERIES:
         ordered = sorted(files, key=lambda path: path.name.casefold())
         first = _next_number(existing, base, "Episode")
         names = [f"{base} - Episode {index:02d}.mkv" for index in range(first, first + len(ordered))]

@@ -240,6 +240,39 @@ export function addToExistingFromJob(job: Job): AddToExisting | null {
   return { outputPath: record.output_path, rippedTitles: ripped };
 }
 
+export type SeriesPlace = {
+  // A season folder of the series, or null for episodes lying loose in the series folder itself.
+  season: number | null;
+  folder: string;
+  episodes: number;
+  nextEpisode: number;
+};
+
+export type SeriesOffer = {
+  // The series' library folder, such as "Desperate Housewives (2004)", and where its episodes can go.
+  series: string;
+  places: SeriesPlace[];
+  nextSeason: number;
+  // The season to suggest: one already there or a new one, or 0 for the series folder itself.
+  defaultSeason: number;
+};
+
+export function seriesOfferFromJob(job: Job): SeriesOffer | null {
+  const value = job.metadata?.series_offer;
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  if (typeof record.series !== "string" || !record.series) return null;
+  const count = (raw: unknown, fallback: number) => (typeof raw === "number" && Number.isFinite(raw) ? raw : fallback);
+  const places = (Array.isArray(record.seasons) ? record.seasons : []).flatMap((item): SeriesPlace[] => {
+    if (!item || typeof item !== "object") return [];
+    const place = item as Record<string, unknown>;
+    if (typeof place.folder !== "string") return [];
+    const season = typeof place.season === "number" ? place.season : null;
+    return [{ season, folder: place.folder, episodes: count(place.episodes, 0), nextEpisode: count(place.next_episode, 1) }];
+  });
+  return { series: record.series, places, nextSeason: count(record.next_season, 1), defaultSeason: count(record.default_season, 1) };
+}
+
 export type MusicRelease = {
   id: string;
   // As cyanrip lists it, for example "Into the Great Wide Open (BIEM / MCPS) (XE) (1991)".

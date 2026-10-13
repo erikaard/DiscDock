@@ -21,6 +21,7 @@ DiscDock is inspired by [Automatic Ripping Machine](https://github.com/automatic
 - **A dashboard** in your browser shows drives, progress, job history, logs and your library. Notifications go through Apprise (Discord, Telegram, email and many more).
 - **Several drives** can work at the same time. Jobs survive a restart or a disconnected drive and can be retried.
 - **Discs ripped before** are recognised. You can rip one again as a new copy, or add more of its titles to the folder it was completed in, for example the other episodes of a series first ripped as a movie. The titles ripped last time are left unticked, new files are numbered after the ones already there, and nothing in the folder is replaced.
+- **Series on several discs** end up in one season. Before a series disc is ripped, DiscDock asks where its episodes go: a season folder already in the library, a new season you give a number, or the series folder itself. Episodes in a season are named *Desperate Housewives (2004) - S01E17*, as Plex, Jellyfin and Kodi expect, and are numbered on from the last episode in the folder you choose, so a box set's discs follow on from each other.
 
 ## Games, programs and other discs
 

@@ -1,3 +1,3 @@
 """DiscDock Windows-native media ingestion service."""
 
-__version__ = "1.10.14"
+__version__ = "1.10.15"

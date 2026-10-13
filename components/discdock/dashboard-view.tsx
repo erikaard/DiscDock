@@ -16,7 +16,7 @@ import { Input } from "@/components/ui/input";
 import { Progress } from "@/components/ui/progress";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { Skeleton } from "@/components/ui/skeleton";
-import { addToExistingFromJob, aiRepairFromJob, albumCoverUrl, albumFromJob, albumName, albumPhotoUrl, archiveCoverUrl, awaitingDiscBackup, damageDetailsFromJob, describeRelease, discContentsFromJob, musicReleasesFromJob, offerDamageReview, rescueFromJob, type AiRepairPlan, type AlbumRelease, type Bootstrap, type Drive, type Job, type MediaKind, type MetadataCandidate, type RescueStatus } from "@/lib/discdock-api";
+import { addToExistingFromJob, aiRepairFromJob, albumCoverUrl, albumFromJob, albumName, albumPhotoUrl, archiveCoverUrl, awaitingDiscBackup, damageDetailsFromJob, describeRelease, discContentsFromJob, musicReleasesFromJob, offerDamageReview, rescueFromJob, seriesOfferFromJob, type AiRepairPlan, type AlbumRelease, type Bootstrap, type Drive, type Job, type MediaKind, type MetadataCandidate, type RescueStatus } from "@/lib/discdock-api";
 import type { DiscDockControls } from "@/hooks/use-discdock";
 import { clearAlbumDraft, clearCoverEdit, readAlbumDraft, readCoverEdit, writeAlbumDraft, writeCoverEdit, type AlbumDraft } from "@/lib/album-draft";
 import type { CoverEdit } from "@/lib/cover-image";
@@ -602,6 +602,20 @@ function DiscBackupCard({ job, busy, controls }: { job: Job; busy: string | null
   );
 }
 
+function twoDigits(value: number): string {
+  return String(value).padStart(2, "0");
+}
+
+function SeasonChoice({ value, label, detail }: { value: string; label: ReactNode; detail: string }) {
+  return (
+    <label className="flex cursor-pointer items-center gap-3 px-3 py-2.5 text-sm hover:bg-white/[0.025]">
+      <RadioGroupItem value={value} />
+      <span className="min-w-0 flex-1">{label}</span>
+      <span className="shrink-0 text-right text-xs text-muted-foreground">{detail}</span>
+    </label>
+  );
+}
+
 function ManualSelectionCard({ job, busy, controls }: { job: Job; busy: string | null; controls: DiscDockControls }) {
   const [selected, setSelected] = useState<number[]>(() => (job.tracks ?? []).filter((track) => track.selected).map((track) => track.source_id));
   const [title, setTitle] = useState(job.title);
@@ -636,6 +650,16 @@ function ManualSelectionCard({ job, busy, controls }: { job: Job; busy: string |
   // A disc completed before, getting more of its titles in the same library folder.
   const joining = addToExistingFromJob(job);
   const joiningFolder = joining ? joining.outputPath.split(/[\\/]/).filter(Boolean).pop() ?? joining.outputPath : "";
+  // A series disc chooses the season folder its episodes go into: one already there, a new one, or none.
+  const offer = joining ? null : seriesOfferFromJob(job);
+  const suggestsExisting = Boolean(offer?.places.some((item) => item.season !== null && item.season === offer.defaultSeason));
+  const [place, setPlace] = useState<string>(() => (!offer ? "new" : offer.defaultSeason === 0 ? "flat" : suggestsExisting ? `season:${offer.defaultSeason}` : "new"));
+  const [newSeason, setNewSeason] = useState(() => String(offer && !suggestsExisting && offer.defaultSeason > 0 ? offer.defaultSeason : offer?.nextSeason ?? 1));
+  const newSeasonNumber = /^\d{1,2}$/.test(newSeason) ? Number(newSeason) : 0;
+  const choosingSeason = offer !== null && mediaKind === "series";
+  const seriesSeason = !choosingSeason ? undefined : place === "flat" ? 0 : place === "new" ? newSeasonNumber : Number(place.slice("season:".length));
+  const seasonReady = seriesSeason === undefined || place !== "new" || newSeasonNumber >= 1;
+  const loose = offer?.places.find((item) => item.season === null);
   return (
     <Card className="job-reveal border-primary/20 bg-card shadow-none">
       <CardHeader className="pb-3"><div className="flex items-start justify-between gap-4"><div className="min-w-0"><p className="text-xs font-medium uppercase tracking-[0.16em] text-primary">{joining ? "Add titles to a completed disc" : "Identify this disc"}</p><CardTitle className="mt-2 truncate text-xl">{title || "Untitled movie"}{year ? ` (${year})` : ""}</CardTitle></div><StateBadge state={job.state} /></div></CardHeader>
@@ -683,7 +707,24 @@ function ManualSelectionCard({ job, busy, controls }: { job: Job; busy: string |
           ))}
           {!job.tracks?.length && <p className="px-4 py-6 text-center text-sm text-muted-foreground">No selectable video titles were found.</p>}
         </div>
-        <div className="mt-5 flex items-center justify-between gap-3"><p className="text-xs text-muted-foreground">{selected.length} selected</p><div className="flex gap-2"><Button disabled={busy !== null} variant="ghost" size="sm" className="text-muted-foreground hover:text-red-300" onClick={() => void controls.cancel(job.id)}>Cancel</Button><Button disabled={busy !== null || selected.length === 0 || !title.trim()} size="sm" className="gap-2 bg-primary text-primary-foreground" onClick={() => void controls.continueJob(job.id, selected, { title: title.trim(), year, media_kind: mediaKind, metadata: manualMetadata })}>{busy === "continue" ? <Loader2 className="size-4 animate-spin" /> : <ListChecks className="size-4" />} {joining ? "Add to the folder" : "Rip selected"}</Button></div></div>
+        {choosingSeason && offer && (
+          <div className="mt-4 rounded-xl border border-white/8 p-3">
+            <p className="text-sm font-medium">Where should these episodes go?</p>
+            <p className="mt-1 text-xs text-muted-foreground">In <span className="text-foreground">{offer.series}</span>. Episodes are numbered on from the last one in the folder you choose.</p>
+            <RadioGroup value={place} onValueChange={setPlace} aria-label="Season folder" className="mt-3 gap-0 divide-y divide-white/7 rounded-lg border border-white/8">
+              {offer.places.filter((item) => item.season !== null).map((item) => (
+                <SeasonChoice key={item.folder} value={`season:${item.season}`} label={item.folder} detail={`${item.episodes} episode${item.episodes === 1 ? "" : "s"} · continues at S${twoDigits(item.season ?? 0)}E${twoDigits(item.nextEpisode)}`} />
+              ))}
+              <SeasonChoice
+                value="new"
+                label={<span className="flex items-center gap-2">New season <Input aria-label="New season number" value={newSeason} maxLength={2} inputMode="numeric" onFocus={() => setPlace("new")} onChange={(event) => { setNewSeason(event.target.value.replace(/\D/g, "")); setPlace("new"); }} className="h-7 w-14 border-white/10 bg-white/[0.025] px-2 text-center" /></span>}
+                detail={newSeasonNumber >= 1 ? `creates "Season ${twoDigits(newSeasonNumber)}"` : "a number from 1 to 99"}
+              />
+              <SeasonChoice value="flat" label="No season folder" detail={loose ? `${loose.episodes} episode${loose.episodes === 1 ? "" : "s"} · continues at Episode ${twoDigits(loose.nextEpisode)}` : `straight into ${offer.series}`} />
+            </RadioGroup>
+          </div>
+        )}
+        <div className="mt-5 flex items-center justify-between gap-3"><p className="text-xs text-muted-foreground">{selected.length} selected</p><div className="flex gap-2"><Button disabled={busy !== null} variant="ghost" size="sm" className="text-muted-foreground hover:text-red-300" onClick={() => void controls.cancel(job.id)}>Cancel</Button><Button disabled={busy !== null || selected.length === 0 || !title.trim() || !seasonReady} size="sm" className="gap-2 bg-primary text-primary-foreground" onClick={() => void controls.continueJob(job.id, selected, { title: title.trim(), year, media_kind: mediaKind, metadata: manualMetadata }, seriesSeason)}>{busy === "continue" ? <Loader2 className="size-4 animate-spin" /> : <ListChecks className="size-4" />} {joining ? "Add to the folder" : choosingSeason ? "Rip into the folder" : "Rip selected"}</Button></div></div>
       </CardContent>
     </Card>
   );

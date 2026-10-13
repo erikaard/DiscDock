@@ -48,11 +48,14 @@ from .files import (
     disk_space_ok,
     ensure_within,
     finalize_directory,
+    library_folder,
     merge_into_directory,
     move_failed_staging,
     output_folder,
     rename_video_outputs,
     safe_component,
+    season_folder,
+    series_seasons,
     verify_media_file,
     verify_outputs,
 )
@@ -693,6 +696,40 @@ def missing_seconds(job: dict[str, Any]) -> float:
         float(moment.get("missing_seconds") or moment.get("duration_seconds") or 0)
         for moment in _damage_moments_for_job(job)
     )
+
+
+def series_offer(completed: Path, title: str, year: str) -> dict[str, Any]:
+    """Where a series disc's episodes can go: a season folder already there, the series folder, or a new season.
+
+    The latest season is suggested, since a box set's next disc usually continues it.
+    Episodes lying loose in the series folder (filed before seasons existed) continue
+    there, and a series new to the library starts with its first season.
+    """
+    series = library_folder(completed, MediaKind.SERIES, title, year)
+    seasons = series_seasons(series)
+    numbered = [season.number for season in seasons if season.number]
+    next_season = max(numbered, default=0) + 1
+    default = max(numbered) if numbered else 0 if seasons else next_season
+    return {
+        "series": series.name,
+        "series_path": str(series),
+        "seasons": [
+            {
+                "season": season.number,
+                "folder": season.folder.name,
+                "episodes": season.episodes,
+                "next_episode": season.next_episode,
+            }
+            for season in seasons
+        ],
+        "next_season": next_season,
+        "default_season": default,
+    }
+
+
+def _series_place_chosen(metadata: dict[str, Any]) -> bool:
+    """Whether a series disc already knows its folder: a season chosen, or titles added to a completed disc."""
+    return isinstance(metadata.get("series_destination"), dict) or isinstance(metadata.get("add_to_existing"), dict)
 
 
 def library_title(job: dict[str, Any]) -> str:
@@ -2251,8 +2288,17 @@ class DiscDockService:
                         f"MakeMKV still leaves out the {_format_duration(feature_skipped)} film after "
                         f"{FEATURE_RESCANS + 1} scans; waiting for a choice instead of ripping a shorter title",
                     )
+                # A series disc waits for its season folder: a box set's discs, one after
+                # another, must land in one season and number on from each other.
+                offer = None
+                if is_video and media_kind == MediaKind.SERIES and not _series_place_chosen(metadata):
+                    offer = await asyncio.to_thread(
+                        series_offer, settings.resolved_directories()["completed"], title, year
+                    )
+                    metadata["series_offer"] = offer
+                    self.database.update_job(job_id, metadata_json=json.dumps(metadata))
                 if (
-                    manual or needs_identification or short_titles_only or always_choosing or feature_skipped
+                    manual or needs_identification or short_titles_only or always_choosing or feature_skipped or offer
                 ) and is_video:
                     status_detail = (
                         f"MakeMKV left out the {_format_duration(feature_skipped)} film because of a navigation "
@@ -2264,6 +2310,8 @@ class DiscDockService:
                         if needs_identification
                         else "Review the title and choose what to rip"
                         if manual
+                        else f"Choose where these episodes go in {offer['series']}"
+                        if offer
                         else "Choose which titles to rip, as set in Settings"
                     )
                     self.database.update_job(
@@ -3711,7 +3759,23 @@ class DiscDockService:
                     job_id,
                     "The folder these titles were to join is no longer in the library; they get a folder of their own",
                 )
-        if existing_folder is not None:
+        destination_choice = (job.get("metadata") or {}).get("series_destination")
+        if existing_folder is None and media_kind == MediaKind.SERIES and isinstance(destination_choice, dict):
+            # The season chosen for this disc, created when it is new, or the series folder itself.
+            series = ensure_within(Path(str(destination_choice.get("series_path") or "")), library_root)
+            season = int(destination_choice.get("season") or 0)
+            # A season folder already there is used as it is named ("Season 2"), not made again as "Season 02".
+            existing_season = next(
+                (place.folder for place in await asyncio.to_thread(series_seasons, series) if place.number == season),
+                None,
+            )
+            target = (existing_season or season_folder(series, season)) if season else series
+            await asyncio.to_thread(target.mkdir, parents=True, exist_ok=True)
+            await asyncio.to_thread(
+                rename_video_outputs, final_source, series.name, media_kind, existing=target, season=season or None
+            )
+            finalized = await merge_into_directory(final_source, target, keep_source)
+        elif existing_folder is not None:
             # Titles added to a disc completed earlier join its folder, next to the files already there.
             await asyncio.to_thread(
                 rename_video_outputs, final_source, existing_folder.name, media_kind, existing=existing_folder
@@ -5669,12 +5733,43 @@ class DiscDockService:
         return self._cds_first(await self._musicbrainz().search_barcode(barcode), track_count)
 
     async def continue_job(
-        self, job_id: str, selected_titles: list[int] | None = None, musicbrainz_release: str | None = None
+        self,
+        job_id: str,
+        selected_titles: list[int] | None = None,
+        musicbrainz_release: str | None = None,
+        series_season: int | None = None,
     ) -> dict[str, Any]:
+        """Rip the titles chosen for a waiting disc.
+
+        A series disc also needs ``series_season``: the season folder its episodes go
+        into, or 0 for the series folder itself. One named in the dashboard without it
+        waits again, now offering the series' seasons.
+        """
         job = self.database.get_job(job_id)
         if not job or job["state"] != JobState.AWAITING_INPUT:
             raise RuntimeError("This job is not waiting for title selection")
         metadata = dict(job.get("metadata") or {})
+        series_choice = False
+        if (
+            job.get("media_kind") == MediaKind.SERIES
+            and job.get("disc_type") in {DiscKind.DVD, DiscKind.BLURAY}
+            and not _series_place_chosen(metadata)
+        ):
+            offer = series_offer(
+                self.settings.resolved_directories()["completed"], str(job.get("title") or ""), str(job.get("year") or "")
+            )
+            if series_season is None:
+                metadata["series_offer"] = offer
+                return self.database.update_job(
+                    job_id,
+                    status_detail=f"Choose where these episodes go in {offer['series']}",
+                    metadata_json=json.dumps(metadata, ensure_ascii=False),
+                )
+            if not 0 <= series_season <= 99:
+                raise RuntimeError("Choose a season from 1 to 99, or no season folder")
+            metadata.pop("series_offer", None)
+            metadata["series_destination"] = {"series_path": offer["series_path"], "season": series_season}
+            series_choice = True
         releases = metadata.get("musicbrainz_releases")
         choosing_release = isinstance(releases, list) and bool(releases)
         if choosing_release:
@@ -5706,7 +5801,9 @@ class DiscDockService:
             raise RuntimeError("Reinsert the original disc before continuing")
         task = asyncio.create_task(self._resume_job(job_id, drive), name=f"resume-{job_id}")
         self._track_job_task(job_id, drive.id, task)
-        changes = {"metadata_json": json.dumps(metadata, ensure_ascii=False)} if choosing_release else {}
+        changes = (
+            {"metadata_json": json.dumps(metadata, ensure_ascii=False)} if choosing_release or series_choice else {}
+        )
         return (
             self.database.update_job(
                 job_id, state=JobState.QUEUED, stage="queued", status_detail="Queued to rip", **changes

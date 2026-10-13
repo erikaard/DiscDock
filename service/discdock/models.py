@@ -178,6 +178,8 @@ class ContinueRequest(BaseModel):
     selected_titles: list[int] | None = None
     # An audio CD's release from job.metadata.musicbrainz_releases, or "none" to rip it without track names.
     musicbrainz_release: str | None = None
+    # A series disc's season folder from job.metadata.series_offer, or 0 for the series folder itself.
+    series_season: int | None = None
 
 
 class SettingsPatch(BaseModel):

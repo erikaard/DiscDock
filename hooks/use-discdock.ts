@@ -100,9 +100,11 @@ export function useDiscDock() {
     uploadAlbumPhoto: (jobId: string, side: "front" | "front_original" | "back", photo: Blob) => action("album-photo", () => api<Job>(`/api/v1/jobs/${jobId}/album/photos/${side}`, { method: "PUT", body: photo, headers: { "Content-Type": photo.type || "image/jpeg" } })),
     removeAlbumPhoto: (jobId: string, side: "front" | "front_original" | "back") => action("album-photo", () => api<Job>(`/api/v1/jobs/${jobId}/album/photos/${side}`, { method: "DELETE" })),
     chooseAlbum: (jobId: string, release: AlbumRelease) => action("choose-album", () => api<Job>(`/api/v1/jobs/${jobId}/album`, { method: "POST", body: JSON.stringify(release) }), "Album chosen. The tracks get its names and tags when the rip is done."),
-    continueJob: (jobId: string, selectedTitles: number[], patch: { title: string; year: string; media_kind: string; metadata?: MetadataCandidate }) => action("continue", async () => {
+    // A series disc also says which season folder its episodes go into, or 0 for the series folder itself.
+    continueJob: (jobId: string, selectedTitles: number[], patch: { title: string; year: string; media_kind: string; metadata?: MetadataCandidate }, seriesSeason?: number) => action("continue", async () => {
       await api<Job>(`/api/v1/jobs/${jobId}`, { method: "PATCH", body: JSON.stringify(patch) });
-      return api<Job>(`/api/v1/jobs/${jobId}/continue`, { method: "POST", body: JSON.stringify({ selected_titles: selectedTitles }) });
+      const body = seriesSeason === undefined ? { selected_titles: selectedTitles } : { selected_titles: selectedTitles, series_season: seriesSeason };
+      return api<Job>(`/api/v1/jobs/${jobId}/continue`, { method: "POST", body: JSON.stringify(body) });
     }, "Ripping selected titles"),
     backUpDisc: (jobId: string, patch: { title: string; year: string; media_kind: string }) => action("back-up-disc", async () => {
       await api<Job>(`/api/v1/jobs/${jobId}`, { method: "PATCH", body: JSON.stringify(patch) });

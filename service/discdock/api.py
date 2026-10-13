@@ -283,7 +283,9 @@ async def patch_job(job_id: str, patch: JobPatch, if_match: str | None = Header(
 @app.post("/api/v1/jobs/{job_id}/continue", status_code=202)
 async def continue_job(job_id: str, request: ContinueRequest):
     try:
-        return await SERVICE.continue_job(job_id, request.selected_titles, request.musicbrainz_release)
+        return await SERVICE.continue_job(
+            job_id, request.selected_titles, request.musicbrainz_release, request.series_season
+        )
     except RuntimeError as error:
         raise HTTPException(409, str(error)) from error
 
